@@ -128,3 +128,21 @@ export function segmentVsSegmentParam(x1, y1, x2, y2, x3, y3, x4, y4) {
 export function segmentVsSegment(x1, y1, x2, y2, x3, y3, x4, y4) {
   return segmentVsSegmentParam(x1, y1, x2, y2, x3, y3, x4, y4) !== null;
 }
+
+// 检测多圆之间的两两碰撞，返回所有发生接触（圆心距 <= minDist）的索引集合。
+// 先收齐全部碰撞索引再统一结算，避免边遍历边杀车导致多车连环碰撞漏判。
+export function findCollidingIndices(circles, minDist) {
+  const hit = new Set();
+  const minDistSq = minDist * minDist;
+  for (let i = 0; i < circles.length; i++) {
+    for (let j = i + 1; j < circles.length; j++) {
+      const dx = circles[j].x - circles[i].x;
+      const dy = circles[j].y - circles[i].y;
+      if (dx * dx + dy * dy <= minDistSq) {
+        hit.add(i);
+        hit.add(j);
+      }
+    }
+  }
+  return hit;
+}

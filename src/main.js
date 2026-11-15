@@ -22,7 +22,7 @@ import {
 } from "./config.js";
 import { Player } from "./player.js";
 import { generateMaze, destroyWallsInRadius, destroyWallSegments } from "./maze.js";
-import { circleVsCircle, separateCircles, resolveCircleWalls, closestPointOnSegment } from "./collision.js";
+import { circleVsCircle, separateCircles, resolveCircleWalls, closestPointOnSegment, findCollidingIndices } from "./collision.js";
 import { fitArena } from "./layout.js";
 import {
   TankExplosion, PickupFlash, ShieldBreak, MuzzleFlash, MineBlast, WallBreak,
@@ -805,9 +805,9 @@ function advanceHints(dt) {
 // weapon 用于统计归类；killerTank 用于排除自伤统计。慢动作与统计的
 // 模式分流集中在这一处（单人模式多敌人：非终局击杀不慢镜、不进终身统计）。
 // 返回 true=击杀成功，false=被盾挡下。
-function hitPlayer(p, weapon, killerTank) {
+function hitPlayer(p, weapon, killerTank, ignoreShield = false) {
   const killerIndex = players.findIndex((pp) => pp.tank === killerTank);
-  if (p.tank.shield) {
+  if (p.tank.shield && !ignoreShield) {
     p.tank.shield = false;
     p.tank.shieldTimer = 0;
     effects.push(new ShieldBreak(p.tank.x, p.tank.y, THEME.shieldRing));
@@ -816,6 +816,8 @@ function hitPlayer(p, weapon, killerTank) {
     if (!soloMode() && !isPyMelee() && killerIndex >= 0 && killerTank !== p.tank) recordHit(killerIndex, weapon);
     return false;
   }
+  p.tank.shield = false;
+  p.tank.shieldTimer = 0;
   p.tank.alive = false;
   // 被**自己的跳弹**打死：新玩家的第一死因，而画面上没有任何东西说明
   // 「反弹后的子弹不认主人」。**判据必须按武器分流**（见 hints.isRicochetSelfKill）：
@@ -899,24 +901,36 @@ function updatePlaying(dt) {
     players[i].tank.update(dt, maze.walls, controls[i]);
   }
 
-  // 2.5) 坦克间碰撞：两车不可重叠，相撞沿圆心连线推开（等量分担）。
-  //      推开可能把车顶进墙，再各自做一次贴墙解算兜底。
-  //      纯位置修正、无反弹动量——手感就是"顶住推不动"，贴近原版。
-  const aliveTanks = players.filter((p) => p.alive).map((p) => p.tank);
-  for (let i = 0; i < aliveTanks.length; i++) {
-    for (let j = i + 1; j < aliveTanks.length; j++) {
-      const a = aliveTanks[i];
-      const b = aliveTanks[j];
-      const sep = separateCircles(a.x, a.y, b.x, b.y, TANK.radius * 2);
-      if (!sep) continue;
-      a.x = sep.ax; a.y = sep.ay;
-      b.x = sep.bx; b.y = sep.by;
-      const fa = resolveCircleWalls(a.x, a.y, TANK.radius, maze.walls);
-      a.x = fa.x; a.y = fa.y;
-      const fb = resolveCircleWalls(b.x, b.y, TANK.radius, maze.walls);
-      b.x = fb.x; b.y = fb.y;
+  // 2.5) 坦克间碰撞：
+  //      对战 / AI 混战模式（!soloMode）：两车发生碰撞（圆心距 ≤ 2*TANK.radius）双方均直接死亡（无视护盾，不偏袒）。
+  //      单人挑战 / 波次模式（soloMode）：保留原版等量推开，防止多敌波次同室误撞互杀。
+  const alivePlayersBefore = players.filter((p) => p.alive);
+  if (!soloMode()) {
+    const crashed = findCollidingIndices(
+      alivePlayersBefore.map((p) => p.tank),
+      TANK.radius * 2,
+    );
+    for (const idx of crashed) {
+      hitPlayer(alivePlayersBefore[idx], "collision", null, true);
+    }
+  } else {
+    const aliveTanksSep = alivePlayersBefore.map((p) => p.tank);
+    for (let i = 0; i < aliveTanksSep.length; i++) {
+      for (let j = i + 1; j < aliveTanksSep.length; j++) {
+        const a = aliveTanksSep[i];
+        const b = aliveTanksSep[j];
+        const sep = separateCircles(a.x, a.y, b.x, b.y, TANK.radius * 2);
+        if (!sep) continue;
+        a.x = sep.ax; a.y = sep.ay;
+        b.x = sep.bx; b.y = sep.by;
+        const fa = resolveCircleWalls(a.x, a.y, TANK.radius, maze.walls);
+        a.x = fa.x; a.y = fa.y;
+        const fb = resolveCircleWalls(b.x, b.y, TANK.radius, maze.walls);
+        b.x = fb.x; b.y = fb.y;
+      }
     }
   }
+  const aliveTanks = players.filter((p) => p.alive).map((p) => p.tank);
 
   // 2.7) 道具：刷新推进 + 拾取检测。
   //      刷新器到点在空格刷一个（避开墙/坦克），场上数受 maxOnField 限流。

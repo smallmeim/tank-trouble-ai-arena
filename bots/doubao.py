@@ -50,6 +50,9 @@ class WraithBot:
         self._aim = 0.0
         self._wander = 0.0
         self._rng = random.Random()
+        # Anti-ram hysteresis: committed dodge side + its expiry tick.
+        self._collision_side = 0
+        self._collision_until = -1
 
     # ------------------------------------------------------------------ #
     # Entry point (never raises: loader also guards, but stay defensive)  #
@@ -120,6 +123,14 @@ class WraithBot:
             self._stuck = 0
             self.mode = "Unstick"
             return -1, side, 0, 0
+
+        # -------------------------------------------------------------- #
+        # 1b. Vehicle collision gate (ram = mutual death, shield ignored)#
+        # -------------------------------------------------------------- #
+        ram = self._collision_gate(x, y, angle, tr, enemies, lidar, tick, rc)
+        if ram is not None:
+            self.mode = "AntiRam"
+            return ram[0], ram[1], 0, 0
 
         # -------------------------------------------------------------- #
         # 2. Steer around armed mines (shield or not, they are cheap)    #
@@ -248,8 +259,15 @@ class WraithBot:
 
         err = _wrap(desired - angle)
         turn = 1 if err > 0.12 else (-1 if err < -0.12 else 0)
+        head_on = (gmode in ("Hunt", "Ambush")
+                   and enemies[0].get("has_los", False)
+                   and enemies[0].get("dist", 9999.0) < 150.0
+                   and abs(err) < 0.4)
         if lidar[0] < tr + 16.0:
             move = -1
+        elif head_on:
+            # Keep the gun lined up while opening the gap (cut-angle kite).
+            move = -1 if lidar[6] > tr + 16.0 else 0
         else:
             move = 1
         self.mode = gmode
@@ -258,6 +276,57 @@ class WraithBot:
     # ------------------------------------------------------------------ #
     # Helpers                                                            #
     # ------------------------------------------------------------------ #
+    def _collision_gate(self, x: float, y: float, angle: float, tr: float,
+                        enemies: list, lidar: list, tick: int, rc):
+        """Emergency anti-ram gate. Return (move, turn) or None.
+
+        Triggers at <=72 px (well before the 32 px lethal contact) and uses
+        relative-velocity closure time so a head-on rush is caught early.
+        """
+        threat = None
+        for e in enemies:
+            d = e.get("dist", 9999.0)
+            if d > 72.0:
+                continue
+            bear = _wrap(math.atan2(e["y"] - y, e["x"] - x) - angle)
+            # Relative velocity under the forward-drive assumption (120 px/s).
+            evx = 120.0 * math.cos(e["angle"])
+            evy = 120.0 * math.sin(e["angle"])
+            mvx = 120.0 * math.cos(angle)
+            mvy = 120.0 * math.sin(angle)
+            rvx, rvy = evx - mvx, evy - mvy
+            closing = True
+            rr2 = rvx * rvx + rvy * rvy
+            if rr2 > 1e-9:
+                rx, ry = e["x"] - x, e["y"] - y
+                tc = (rx * rvx + ry * rvy) / rr2  # >0 iff closing
+                closing = tc > 0.0
+            if abs(bear) < 1.25 and (closing or d < 52.0):
+                threat = (d, bear)
+                break
+
+        if threat is None:
+            self._collision_side = 0
+            return None
+
+        d, bear = threat
+
+        # Commit one dodge side for several frames (no flip-flop at corners).
+        if tick >= self._collision_until or self._collision_side == 0:
+            open_right = rc(angle + HALF_PI, 110.0)
+            open_left = rc(angle - HALF_PI, 110.0)
+            self._collision_side = 1 if open_right >= open_left else -1
+            self._collision_until = tick + 12
+
+        if abs(bear) >= 1.0:
+            # Foe abeam/behind: punch forward, turn away from it.
+            return 1, (1 if bear < 0.0 else -1)
+
+        # Foe ahead: side-slip; back-pedal when nose-to-nose or wall ahead.
+        if lidar[0] < tr + 20.0 or (abs(bear) < 0.45 and d < 60.0):
+            return -1, self._collision_side
+        return 1, self._collision_side
+
     def _danger_shell(self, x: float, y: float, tr: float, sr: float,
                       shells: list, tb) -> tuple[float, float] | None:
         """Return shell velocity vector if it is on a collision course with me."""
@@ -311,12 +380,21 @@ class WraithBot:
                 best_pw = pw
 
         if best_pw is not None:
+            my_d = best_pw["dist"]
+            # Abandon the crate if any foe is as close to it as we are:
+            # racing the last metres risks a mutual ram with no score.
+            contested = any(
+                math.hypot(e["x"] - best_pw["x"], e["y"] - best_pw["y"])
+                < my_d + 20.0 for e in enemies
+            )
             near_enemy = enemies[0]["dist"] if enemies else float("inf")
-            if best_pw["dist"] < near_enemy * 1.1 + 40.0:
+            if not contested and my_d < near_enemy * 1.1 + 40.0:
                 return best_pw["x"], best_pw["y"], "Seek:" + best_pw["type"]
 
         if enemies:
-            return enemies[0]["x"], enemies[0]["y"], "Hunt"
+            # Ambush = hold a cut angle / bank shot instead of face-tanking.
+            mode = "Ambush" if best_pw is not None else "Hunt"
+            return enemies[0]["x"], enemies[0]["y"], mode
         return None
 
     def _maybe_mine(self, me: dict, enemies: list, lidar: list, tick: int) -> int:

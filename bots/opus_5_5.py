@@ -72,6 +72,31 @@ class VanguardBot:
                 self._evel[eid] = (0.7*pvx + 0.3*(e["x"]-ox), 0.7*pvy + 0.3*(e["y"]-oy))
             self._ehist[eid] = (e["x"], e["y"])
 
+        # --- PRIORITY 0: LETHAL tank-collision avoidance --------------------------
+        # New rule: dist <= 2*tr (32 px) → both die instantly, shield ignored.
+        # At max closing speed 240 px/s, 30 Hz → ~8 px/frame.  Start at 68 px
+        # (~4-5 frames of response), emergency reverse at 42 px.
+        _SAFE, _CRIT = 68.0, 42.0
+        for _en in enemies:
+            if _en["dist"] > _SAFE:
+                continue
+            self.mode = "AntiCrash"
+            _ang_to = math.atan2(_en["y"] - me["y"], _en["x"] - me["x"])
+            _facing = abs(_wrap(_ang_to - me["angle"]))  # 0=facing them, pi=away
+            # Turn toward the lidar-open perpendicular side
+            _t = 1 if lidar[3] >= lidar[9] else -1
+            if _en["dist"] < _CRIT or _facing < 1.2:
+                # Enemy roughly ahead OR critically close: reverse to escape
+                _mv = -1 if lidar[6] > tr + 10.0 else 1
+                # Bonus: drop mine into enemy's path while backing away
+                _sp = 1 if (me.get("mine_charges", 0) > 0 and _facing < 1.0) else 0
+            else:
+                # Facing away already: accelerate out of danger zone
+                _mv = 1 if lidar[0] > tr + 10.0 else -1
+                _sp = 0
+            return _mv, _t, 0, _sp
+        # ---------------------------------------------------------------------------
+
         # --- 1. Armed mine avoidance ---
         for mn in state.get("mines") or []:
             if mn.get("armed") and mn["dist"] < 80.0:
@@ -110,6 +135,9 @@ class VanguardBot:
                 special = 1
 
         # --- 4. Powerup routing (shield>laser>scatter>mine, within range) ---
+        # Skip contested powerups: if an enemy is also near the same item AND
+        # close enough to cause a collision on the approach, skip rather than
+        # risk a head-on crash for a pickup.
         nav: tuple | None = None
         for pu in state.get("powerups") or []:
             if pu["dist"] > 270.0:
@@ -120,6 +148,14 @@ class VanguardBot:
                    3 if pt == "scatter" and not me.get("scatter_shots", 0) else
                    2 if pt == "mine" and not me.get("mine_charges", 0) else 0)
             if pri >= 3 and pu["dist"] < 240.0:
+                # Contested check: any enemy within 95 px of the powerup →
+                # rushing in risks a crash (they may converge on the same point).
+                _contested = any(
+                    math.hypot(_e["x"] - pu["x"], _e["y"] - pu["y"]) < 95.0
+                    for _e in enemies
+                )
+                if _contested and not me.get("shield"):
+                    continue  # skip; don't rush into a crash
                 nav = (pu["x"], pu["y"])
                 self.mode = "Pickup"
                 break

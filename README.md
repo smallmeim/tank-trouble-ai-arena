@@ -4,12 +4,47 @@
 
 > **AI Code Arena Extension**: Built on top of [`AbyssWhalen/tank-trouble`](https://github.com/AbyssWhalen/tank-trouble) (MIT License) with a Flask + Python bot bridge (`server.py`, `py_maze_helpers.py`, `bots/*.py`) so 2–6 AI-written Python tank scripts can battle each other alongside human players and built-in JS AIs.
 
-### 快速启动 AI 代码混战 | Quick Start (Python AI Arena)
+---
 
-1. 安装依赖（Python 3.10+）：`pip install flask`
-2. 启动服务并打开浏览器：`python server.py --open`（Windows 可直接双击 `launch_arena.bat`）
-3. 将任意大模型编写的 `.py` 小车放入 `bots/` 目录（写作规范与提示词见 [`PROMPT_FOR_OTHER_AI.md`](./PROMPT_FOR_OTHER_AI.md)），在页面顶部点击 **「🔄 刷新 bots/」** 后即可给 1~6 号车分别指派不同 AI 模型脚本开打。
-4. 运行校验：`node scripts/smoke.mjs` 与 `python -m unittest discover -s tests -v`。
+## 新手下载即玩教程（Windows 五步开战）
+
+### 第 1 步：准备 Python 环境（只需一次）
+- 如果电脑尚未安装 Python，前往 [python.org/downloads](https://www.python.org/downloads/) 下载安装 Python 3.10 或更高版本。
+- **安装界面底部务必勾选 `Add python.exe to PATH`**，然后一路点击 `Install Now`。
+
+### 第 2 步：下载游戏压缩包
+1. 打开本仓库右侧（或顶部）的 **[Releases 页面](https://github.com/smallmeim/tank-trouble-ai-arena/releases/latest)**。
+2. 在 `Assets` 栏点击下载 **`tank-trouble-ai-arena-v1.1.0.zip`**（不要只下载 `Source code` 源码，直接用打包好的压缩包即可，或者下载任意最新 `.zip`）。
+3. 右键下载好的压缩包，选择 **「全部解压缩」** 到电脑任意文件夹（例如 `D:\Games\tank-trouble-ai-arena`）。
+
+### 第 3 步：一键启动（可选生成桌面图标）
+- 进入解压后的文件夹，**双击运行 `launch_arena.bat`**：
+  - 首次运行会自动检测并安装所需的 `flask` 依赖；
+  - 几秒后会自动启动本地服务并打开浏览器进入游戏页面（**游玩期间请保持弹出的黑色终端窗口开启**，关闭它即停止服务）。
+- **想在桌面放图标？** 双击运行一次同目录下的 **`create_desktop_shortcut.bat`**，桌面上就会多出一个带坦克图标的 **`坦克回廊 AI混战`** 快捷方式，以后直接双击桌面图标就能开玩！
+
+### 第 4 步：选车 & 开战
+- 网页顶部的 **「AI 代码混战」** 配置栏默认已加载 `bots/` 文件夹中的 6 位 AI 选手：
+  - `6Astra`（[bots/6astra.py](bots/6astra.py)）
+  - `Opus 5.5`（[bots/opus_5_5.py](bots/opus_5_5.py)）
+  - `DeepSeek`（[bots/deepseek.py](bots/deepseek.py)）
+  - `6.1 Sol`（[bots/6_1_sol.py](bots/6_1_sol.py)）
+  - `豆包`（[bots/doubao.py](bots/doubao.py)）
+  - `Argon`（[bots/argon.py](bots/argon.py)）
+- 你可以自由选择 **2 ~ 6 辆车**，给每辆车指派不同 AI 脚本，也可以混入 **玩家1 (`WASD + 空格 + E`)** / **玩家2 (`方向键 + Enter + 右Shift`)** 亲自下场，点 **「▶ 立即开战」** 即可开打！
+
+### 第 5 步：让其他 AI 写新小车加赛
+1. 点击网页顶部的 **「复制 AI 写车提示词」** → **「一键复制提示词」**（系统会自动把当前电脑的 `bots/` 文件夹真实路径填进提示词里）。
+2. 把提示词发给任意 AI / 编程助手生成 `.py` 脚本并放进 `bots/` 文件夹。
+3. 回到游戏网页点 **「🔄 刷新 bots/」** 即可热加载上场（无需重启游戏）。
+
+---
+
+## 本版新增混战规则亮点
+
+- **两车碰撞双方死亡**：在对战与 AI 混战模式下，两辆存活坦克发生车体接触（中心距 `<= 32 px`）时**双方均会直接爆炸死亡**，且**护盾无法免除撞死**。
+- **动态破墙与四种道具**：延续原版散射、护盾、反弹激光、隐形地雷与内墙炸毁同步，Python AI 通过 `helpers` 实时获取破墙后的最短路径与反弹轨迹。
+- **开发者校验命令**：`node scripts/smoke.mjs`、`node tests/test_collision_rule.mjs`、`python -m unittest discover -s tests -v`。
 
 ---
 

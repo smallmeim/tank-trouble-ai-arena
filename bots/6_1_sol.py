@@ -53,6 +53,51 @@ class CodexHarrier:
             self._stuck = max(0, self._stuck - 2)
         self._last_xy = (x, y)
 
+        # Predict short-range body collisions before aiming, collecting, or dodging shells.
+        # Shields do not protect against tank-to-tank impacts.
+        close_enemies = [e for e in enemies if e.get("dist", 1e9) < 86.0]
+        if close_enemies:
+            dt = 0.05
+            horizon_steps = 6
+            turn_speed = arena.get("turn_speed", 3.0)
+            tank_speed = arena.get("tank_speed", 120.0)
+            best_action = (0, 0)
+            best_score = -1e9
+            for move_candidate in (-1, 0, 1):
+                for turn_candidate in (-1, 0, 1):
+                    px, py, pa = x, y, angle
+                    min_separation = float("inf")
+                    for step in range(1, horizon_steps + 1):
+                        pa += turn_candidate * turn_speed * dt
+                        px += move_candidate * tank_speed * math.cos(pa) * dt
+                        py += move_candidate * tank_speed * math.sin(pa) * dt
+                        elapsed = step * dt
+                        for enemy in close_enemies:
+                            ex, ey = enemy["x"], enemy["y"]
+                            toward_x, toward_y = x - ex, y - ey
+                            toward_len = max(1.0, math.hypot(toward_x, toward_y))
+                            enemy_facing_us = ((math.cos(enemy["angle"]) * toward_x
+                                                + math.sin(enemy["angle"]) * toward_y) / toward_len)
+                            enemy_speed = tank_speed if enemy_facing_us > 0.15 else 0.0
+                            ex += enemy_speed * math.cos(enemy["angle"]) * elapsed
+                            ey += enemy_speed * math.sin(enemy["angle"]) * elapsed
+                            separation = math.hypot(px - ex, py - ey)
+                            min_separation = min(min_separation, separation)
+
+                    # Avoid choosing a mathematically safe path that immediately drives into a wall.
+                    relative_heading = _wrap(pa - angle + (math.pi if move_candidate < 0 else 0.0))
+                    lidar_index = int(round(relative_heading / (math.pi / 6.0))) % 12
+                    clearance = lidar[lidar_index] if move_candidate else float("inf")
+                    wall_penalty = max(0.0, tank_r + 22.0 - clearance) * 2.0
+                    end_separation = min(math.hypot(px - e["x"], py - e["y"]) for e in close_enemies)
+                    score = min_separation + 0.25 * end_separation - wall_penalty
+                    if score > best_score:
+                        best_score = score
+                        best_action = (move_candidate, turn_candidate)
+
+            self.mode = "AvoidTank"
+            return best_action[0], best_action[1], 0, 0
+
         # Back out of corners before resuming navigation.
         if self._stuck > 12:
             turn = 1 if lidar[3] >= lidar[9] else -1

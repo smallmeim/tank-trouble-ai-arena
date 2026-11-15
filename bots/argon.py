@@ -39,6 +39,8 @@ class ArgonVanguardBot:
     def __init__(self) -> None:
         self.mode: str = "Init"
         self.pos_history: deque[tuple[float, float]] = deque(maxlen=24)
+        self.enemy_prev_pos: dict[int, tuple[float, float, int]] = {}
+        self.enemy_vel: dict[int, tuple[float, float]] = {}
         self.unstuck_timer: int = 0
         self.unstuck_turn: int = 1
         self.mine_cooldown: int = 0
@@ -62,6 +64,8 @@ class ArgonVanguardBot:
         if tick < self.last_tick:
             # New round reset
             self.pos_history.clear()
+            self.enemy_prev_pos.clear()
+            self.enemy_vel.clear()
             self.unstuck_timer = 0
             self.mine_cooldown = 0
         self.last_tick = tick
@@ -75,12 +79,16 @@ class ArgonVanguardBot:
         tank_r = float(arena.get("tank_radius", 16.0))
         shell_r = float(arena.get("shell_radius", 3.0))
         shell_speed = float(arena.get("shell_speed", 180.0))
+        tank_speed = float(arena.get("tank_speed", 120.0))
+        turn_speed = float(arena.get("turn_speed", 3.0))
         has_shield = bool(me.get("shield", False))
         laser_shots = int(me.get("laser_shots", 0))
         scatter_shots = int(me.get("scatter_shots", 0))
         mine_charges = int(me.get("mine_charges", 0))
         can_fire = bool(me.get("can_fire", True))
         lidar: list[float] = list(me.get("lidar", [200.0] * 12))
+
+        self._update_enemy_velocities(enemies, tick, tank_speed)
 
         raycast = helpers.get("raycast")
         trace_bounces = helpers.get("trace_bounces")
@@ -98,19 +106,27 @@ class ArgonVanguardBot:
                 has_shield, laser_shots, scatter_shots, can_fire,
                 enemies, trace_bounces
             )
-            return -1, self.unstuck_turn, fire_now, 0
+            u_move, u_turn = self._apply_collision_safety_gate(
+                mx, my, m_angle, -1, self.unstuck_turn,
+                tank_speed, turn_speed, lidar, enemies
+            )
+            return u_move, u_turn, fire_now, 0
 
         if len(self.pos_history) == self.pos_history.maxlen and tick % 6 == 0:
             old_x, old_y = self.pos_history[0]
             if math.hypot(mx - old_x, my - old_y) < 5.5:
-                self.unstuck_timer = 12
+                self.unstuck_timer = 10
                 # Turn toward the side with greater lidar clearance
                 left_space = sum(lidar[8:12])
                 right_space = sum(lidar[1:5])
                 self.unstuck_turn = -1 if left_space > right_space else 1
                 self.pos_history.clear()
                 self.mode = "Unstuck"
-                return -1, self.unstuck_turn, 0, 0
+                u_move, u_turn = self._apply_collision_safety_gate(
+                    mx, my, m_angle, -1, self.unstuck_turn,
+                    tank_speed, turn_speed, lidar, enemies
+                )
+                return u_move, u_turn, 0, 0
 
         # ------------------------------------------------------------------
         # 2. Tactical mine deployment
@@ -122,15 +138,20 @@ class ArgonVanguardBot:
                 self.mine_cooldown = 45
 
         # ------------------------------------------------------------------
-        # 3. Ballistic & mine threat evaluation (Evasion)
+        # 3. Ballistic, mine & close-body collision threat evaluation
         # ------------------------------------------------------------------
         evade_angle, threat_urgency = self._evaluate_threats(
-            mx, my, m_angle, tank_r, shell_r, has_shield, shells, mines, raycast
+            mx, my, m_angle, tank_r, shell_r, has_shield,
+            shells, mines, enemies, raycast
         )
         if threat_urgency > 0.0 and evade_angle is not None:
             self.mode = "Evade"
             move, turn = self._drive_toward_angle(
                 m_angle, evade_angle, lidar, allow_reverse=True, urgent=True
+            )
+            move, turn = self._apply_collision_safety_gate(
+                mx, my, m_angle, move, turn,
+                tank_speed, turn_speed, lidar, enemies
             )
             fire = self._check_instant_fire(
                 mx, my, m_angle, tank_r, shell_r, shell_speed,
@@ -159,7 +180,7 @@ class ArgonVanguardBot:
         )
 
         # If we found an imminent bank-shot / direct-shot angle close to current heading,
-        # prioritize snapping our turret to finish the shot.
+        # prioritize snapping our turret to finish the shot (unless a collision risk overrides).
         if aim_override_angle is not None:
             self.mode = "SnipeAim"
             ang_err = _wrap_angle(aim_override_angle - m_angle)
@@ -172,16 +193,139 @@ class ArgonVanguardBot:
                 move = -1
             else:
                 move = 0
+            move, turn = self._apply_collision_safety_gate(
+                mx, my, m_angle, move, turn,
+                tank_speed, turn_speed, lidar, enemies
+            )
             return move, turn, fire, special
 
         move, turn = self._drive_toward_angle(
             m_angle, target_angle, lidar, allow_reverse=True, urgent=False
+        )
+        move, turn = self._apply_collision_safety_gate(
+            mx, my, m_angle, move, turn,
+            tank_speed, turn_speed, lidar, enemies
         )
         return move, turn, fire, special
 
     # ======================================================================
     # Helper methods
     # ======================================================================
+
+    def _update_enemy_velocities(
+        self, enemies: list[dict[str, Any]], tick: int, tank_speed: float
+    ) -> None:
+        """Track enemy positions across ticks to estimate velocity vectors."""
+        active_ids: set[int] = set()
+        for e in enemies:
+            eid = int(e.get("id", -1))
+            active_ids.add(eid)
+            ex = float(e["x"])
+            ey = float(e["y"])
+            prev = self.enemy_prev_pos.get(eid)
+            if prev is not None:
+                px, py, ptick = prev
+                dt = max(1, tick - ptick) / 30.0
+                vx = max(-tank_speed, min(tank_speed, (ex - px) / dt))
+                vy = max(-tank_speed, min(tank_speed, (ey - py) / dt))
+                old_vx, old_vy = self.enemy_vel.get(eid, (vx, vy))
+                self.enemy_vel[eid] = (0.6 * vx + 0.4 * old_vx, 0.6 * vy + 0.4 * old_vy)
+            else:
+                self.enemy_vel[eid] = (0.0, 0.0)
+            self.enemy_prev_pos[eid] = (ex, ey, tick)
+
+        for eid in list(self.enemy_prev_pos.keys()):
+            if eid not in active_ids:
+                self.enemy_prev_pos.pop(eid, None)
+                self.enemy_vel.pop(eid, None)
+
+    def _apply_collision_safety_gate(
+        self,
+        mx: float,
+        my: float,
+        m_angle: float,
+        move: int,
+        turn: int,
+        tank_speed: float,
+        turn_speed: float,
+        lidar: list[float],
+        enemies: list[dict[str, Any]],
+    ) -> tuple[int, int]:
+        """
+        High-priority anti-collision safety gate:
+        Tank-to-tank contact (dist <= 32px) kills BOTH tanks instantly regardless of shield.
+        If any enemy is within 74px (or closing fast within 92px), verify that our next step
+        does not bring us into collision range; otherwise override (move, turn) to separate.
+        """
+        if not enemies:
+            return move, turn
+
+        close_threats: list[tuple[float, float, float, float, float]] = []
+        for e in enemies:
+            dist = float(e.get("dist", 999.0))
+            if dist > 92.0:
+                continue
+            eid = int(e.get("id", -1))
+            ex = float(e["x"])
+            ey = float(e["y"])
+            e_ang = float(e.get("angle", 0.0))
+            evx, evy = self.enemy_vel.get(eid, (0.0, 0.0))
+            # Blend observed velocity with worst-case lunge toward us along enemy heading
+            to_me_x = (mx - ex) / (dist or 1.0)
+            to_me_y = (my - ey) / (dist or 1.0)
+            heading_x = math.cos(e_ang)
+            heading_y = math.sin(e_ang)
+            align = abs(heading_x * to_me_x + heading_y * to_me_y)
+            worst_vx = evx * 0.55 + to_me_x * tank_speed * (0.45 if align > 0.5 else 0.25)
+            worst_vy = evy * 0.55 + to_me_y * tank_speed * (0.45 if align > 0.5 else 0.25)
+            close_threats.append((ex, ey, worst_vx, worst_vy, dist))
+
+        if not close_threats:
+            return move, turn
+
+        dt = 0.085  # ~2.5 frames lookahead
+
+        def _min_sep_for_action(mv: int, trn: int) -> float:
+            next_ang = m_angle + trn * turn_speed * dt
+            step = mv * tank_speed * dt
+            # Respect wall clearance so we don't assume we can phase through a wall
+            if len(lidar) >= 12:
+                if mv > 0 and min(lidar[0], lidar[11] * 1.1, lidar[1] * 1.1) < 22.0:
+                    step = 0.0
+                elif mv < 0 and min(lidar[6], lidar[5] * 1.1, lidar[7] * 1.1) < 22.0:
+                    step = 0.0
+            nx = mx + math.cos(next_ang) * step
+            ny = my + math.sin(next_ang) * step
+
+            worst_sep = 999.0
+            for ex, ey, wvx, wvy, cur_d in close_threats:
+                nex = ex + wvx * dt
+                ney = ey + wvy * dt
+                sep = math.hypot(nx - nex, ny - ney)
+                worst_sep = min(worst_sep, sep)
+            return worst_sep
+
+        min_cur_dist = min(t[4] for t in close_threats)
+        planned_sep = _min_sep_for_action(move, turn)
+
+        # Safe if planned separation stays comfortably above 62px and isn't shrinking inside 58px
+        if planned_sep >= 62.0 and (min_cur_dist > 58.0 or planned_sep >= min_cur_dist + 1.5):
+            return move, turn
+
+        # Search all (mv, trn) combinations for the action that maximizes separation
+        best_mv, best_trn = move, turn
+        best_score = -999.0
+        for cand_mv in (-1, 1, 0):
+            for cand_trn in (-1, 0, 1):
+                sep = _min_sep_for_action(cand_mv, cand_trn)
+                # Slight preference for keeping current turn if separation is tied
+                score = sep - (0.3 if cand_trn != turn else 0.0) - (0.2 if cand_mv == 0 else 0.0)
+                if score > best_score:
+                    best_score = score
+                    best_mv, best_trn = cand_mv, cand_trn
+
+        self.mode = "AntiCollide"
+        return best_mv, best_trn
 
     def _should_drop_mine(
         self,
@@ -197,12 +341,11 @@ class ArgonVanguardBot:
                 return False
 
         nearest_dist = float(enemies[0]["dist"]) if enemies else 999.0
-        # Don't drop a mine right on top of an enemy shooting us point-blank
-        if nearest_dist < 48.0:
+        if nearest_dist < 40.0:
             return False
 
-        # Case A: Enemy is chasing in medium range
-        if 55.0 <= nearest_dist <= 240.0:
+        # Case A: Enemy is chasing or pressuring in close-to-medium range
+        if 42.0 <= nearest_dist <= 240.0:
             return True
 
         # Case B: Narrow corridor / doorway choke point
@@ -224,9 +367,10 @@ class ArgonVanguardBot:
         has_shield: bool,
         shells: list[dict[str, Any]],
         mines: list[dict[str, Any]],
+        enemies: list[dict[str, Any]],
         raycast: Any,
     ) -> tuple[float | None, float]:
-        """Compute emergency evasion angle and urgency score."""
+        """Compute emergency evasion angle and urgency score (shells, mines, and ramming enemies)."""
         danger_x = 0.0
         danger_y = 0.0
         max_urgency = 0.0
@@ -261,7 +405,7 @@ class ArgonVanguardBot:
             if miss_dist < safe_radius:
                 urgency = (1.4 - t_clamp) * ((safe_radius - miss_dist) / safe_radius + 0.5)
                 if has_shield:
-                    urgency *= 0.25  # Shield can tank 1 hit, only dodge very close shots
+                    urgency *= 0.25  # Shield can tank 1 shell hit, only dodge very close shots
                 if urgency > 0.15:
                     # Sidestep perpendicular to shell velocity
                     speed = math.sqrt(speed_sq)
@@ -298,6 +442,35 @@ class ArgonVanguardBot:
                 d = math.hypot(dx, dy) or 1.0
                 danger_x += (dx / d) * urgency * 2.0
                 danger_y += (dy / d) * urgency * 2.0
+                max_urgency = max(max_urgency, urgency)
+
+        # 3. Close enemy body collision threat (Shield does NOT protect against collision!)
+        collision_warn_r = 74.0
+        for e in enemies:
+            dist = float(e.get("dist", 999.0))
+            if dist < collision_warn_r:
+                eid = int(e.get("id", -1))
+                ex = float(e["x"])
+                ey = float(e["y"])
+                evx, evy = self.enemy_vel.get(eid, (0.0, 0.0))
+                # Predict slightly ahead
+                dx = mx - (ex + evx * 0.08)
+                dy = my - (ey + evy * 0.08)
+                d = math.hypot(dx, dy) or 1.0
+                ux, uy = dx / d, dy / d
+
+                # Add slight tangential sidestep toward the side with better wall clearance
+                tx1, ty1 = -uy, ux
+                tx2, ty2 = uy, -ux
+                if callable(raycast):
+                    c1 = float(raycast(mx, my, math.atan2(ty1, tx1), 65.0))
+                    c2 = float(raycast(mx, my, math.atan2(ty2, tx2), 65.0))
+                    if c2 > c1:
+                        tx1, ty1 = tx2, ty2
+
+                urgency = ((collision_warn_r - dist) / (collision_warn_r - 32.0)) ** 1.35 * 2.4
+                danger_x += (ux * 0.82 + tx1 * 0.35) * urgency * 2.4
+                danger_y += (uy * 0.82 + ty1 * 0.35) * urgency * 2.4
                 max_urgency = max(max_urgency, urgency)
 
         if max_urgency > 0.0 and (abs(danger_x) > 1e-4 or abs(danger_y) > 1e-4):
@@ -360,7 +533,13 @@ class ArgonVanguardBot:
             for e in enemies:
                 ex = float(e["x"])
                 ey = float(e["y"])
-                # Apply slight velocity lead on direct (i == 0) shots if enemy is moving
+                if i == 0 and not is_laser:
+                    eid = int(e.get("id", -1))
+                    evx, evy = self.enemy_vel.get(eid, (0.0, 0.0))
+                    approx_t = min(0.28, float(e.get("dist", 100.0)) / max(1.0, shell_speed) * 0.5)
+                    ex += evx * approx_t
+                    ey += evy * approx_t
+
                 dist_to_seg, along = _point_to_segment_dist(ex, ey, x1, y1, x2, y2)
                 travel_dist = total_path_len + along
 
@@ -497,7 +676,17 @@ class ArgonVanguardBot:
         nearest_enemy = enemies[0] if enemies else None
         nearest_enemy_dist = float(nearest_enemy["dist"]) if nearest_enemy else 9999.0
 
-        # 1. Evaluate best powerup to contest
+        # 0. Emergency anti-ram spacing: never rush toward a close enemy (even around a corner)
+        if nearest_enemy is not None and nearest_enemy_dist < 88.0:
+            ex = float(nearest_enemy["x"])
+            ey = float(nearest_enemy["y"])
+            ang_to_enemy = math.atan2(ey - my, ex - mx)
+            self.mode = "AntiRamKite"
+            if random.random() < 0.04:
+                self.strafe_dir *= -1
+            return _wrap_angle(ang_to_enemy + math.pi + 0.42 * self.strafe_dir)
+
+        # 1. Evaluate best powerup to contest (avoiding head-on collision over contested boxes)
         best_pu = None
         best_pu_val = 0.0
         weights = {
@@ -508,10 +697,29 @@ class ArgonVanguardBot:
         }
         for pu in powerups:
             ptype = str(pu.get("type", ""))
+            px, py = float(pu["x"]), float(pu["y"])
             pdist = max(25.0, float(pu.get("dist", 500.0)))
             w = weights.get(ptype, 1.0)
-            # Score decays with distance; ignore if an enemy is right in our face unless it's a shield
-            if nearest_enemy_dist < 130.0 and ptype != "shield" and pdist > 110.0:
+
+            # Check if any enemy is contesting this box closely or sitting between us and the box
+            contested_collision_risk = False
+            for e in enemies:
+                edist_to_pu = math.hypot(float(e["x"]) - px, float(e["y"]) - py)
+                edist_to_me = float(e.get("dist", 999.0))
+                # If enemy is closer or almost equally close to a nearby powerup, don't dive in and collide
+                if edist_to_pu < 88.0 and (edist_to_pu <= pdist + 26.0 or edist_to_me < 105.0):
+                    contested_collision_risk = True
+                    break
+                # Or if the enemy lies right along our direct segment to the powerup
+                seg_d, _ = _point_to_segment_dist(float(e["x"]), float(e["y"]), mx, my, px, py)
+                if seg_d < 62.0 and edist_to_me < pdist + 20.0:
+                    contested_collision_risk = True
+                    break
+
+            if contested_collision_risk:
+                continue
+
+            if nearest_enemy_dist < 135.0 and ptype != "shield" and pdist > 105.0:
                 continue
             val = (w * 260.0) / (pdist + 40.0)
             if val > best_pu_val:
@@ -535,22 +743,32 @@ class ArgonVanguardBot:
             )
             we_armed = has_shield or laser_shots > 0 or scatter_shots > 0
 
-            # In LOS combat spacing
+            # In LOS combat spacing: strictly maintain safe standoff ring (115~165px)
             if has_los:
                 ang_to_enemy = math.atan2(ey - my, ex - mx)
-                if we_armed and not nearest_enemy.get("shield", False):
-                    self.mode = "PushAttack"
-                    return ang_to_enemy
-                if nearest_enemy_dist < 155.0 and enemy_armed and not has_shield:
-                    # Tactical kite away / strafe
+                if random.random() < 0.03:
+                    self.strafe_dir *= -1
+
+                if nearest_enemy_dist < 125.0 or (nearest_enemy_dist < 165.0 and enemy_armed and not has_shield):
+                    # Back-kite obliquely to prevent ramming while keeping firing angles open
                     self.mode = "KiteBack"
-                    return _wrap_angle(ang_to_enemy + math.pi + 0.35 * self.strafe_dir)
-                if nearest_enemy_dist < 230.0:
-                    # Strafe at oblique angle to make us harder to hit while keeping turret near enemy
+                    return _wrap_angle(ang_to_enemy + math.pi - 0.48 * self.strafe_dir)
+
+                if nearest_enemy_dist < 220.0:
+                    # Oblique strafe around the standoff ring (never drive straight at enemy!)
                     self.mode = "CombatStrafe"
-                    if random.random() < 0.03:
-                        self.strafe_dir *= -1
-                    return _wrap_angle(ang_to_enemy + 0.55 * self.strafe_dir)
+                    return _wrap_angle(ang_to_enemy + 0.72 * self.strafe_dir)
+
+                if we_armed and not nearest_enemy.get("shield", False):
+                    # Close distance only when far (>220px) and at a slight flank angle
+                    self.mode = "FlankAdvance"
+                    return _wrap_angle(ang_to_enemy + 0.30 * self.strafe_dir)
+
+            # Non-LOS corner caution: if enemy is close behind a wall/corner, don't hug the corner tightly
+            if nearest_enemy_dist < 118.0:
+                ang_to_enemy = math.atan2(ey - my, ex - mx)
+                self.mode = "CornerGuard"
+                return _wrap_angle(ang_to_enemy + 0.85 * self.strafe_dir)
 
             # Use precomputed next_waypoint if available
             wp = nearest_enemy.get("next_waypoint")

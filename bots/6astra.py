@@ -29,10 +29,58 @@ class PhantomBot:
 
     def act(self, state):
         try:
-            return self._act(state)
+            action = self._act(state)
+            return self._avoid_collision(state, action)
         except Exception:
             self.mode = "Recover"
             return 0, 0, 0, 0
+
+    def _avoid_collision(self, state, action):
+        me = state["me"]
+        arena = state.get("arena", {})
+        radius = arena.get("tank_radius", 16.0)
+        speed = arena.get("tank_speed", 120.0)
+        turn_speed = arena.get("turn_speed", 3.0)
+        lidar = me.get("lidar", [0.0] * 12)
+        x, y, angle = me["x"], me["y"], me["angle"]
+        nearby = [e for e in state.get("enemies", []) if e.get("dist", 1e9) < 90]
+        if not nearby:
+            return action
+
+        # Consider both directions of enemy travel: heading does not reveal reverse gear.
+        horizon = 0.3
+        def clearance(move, turn):
+            heading = angle + turn * turn_speed * horizon / 2
+            mx = x + move * speed * horizon * math.cos(heading)
+            my = y + move * speed * horizon * math.sin(heading)
+            closest = float("inf")
+            for enemy in nearby:
+                ex, ey = enemy["x"] - x, enemy["y"] - y
+                enemy_angle = enemy.get("angle", 0.0)
+                for direction in (-1, 0, 1):
+                    dx = ex + direction * speed * horizon * math.cos(enemy_angle) - (mx - x)
+                    dy = ey + direction * speed * horizon * math.sin(enemy_angle) - (my - y)
+                    closest = min(closest, math.sqrt(_segment_distance2(0, 0, ex, ey, dx, dy)))
+            return closest
+
+        move, turn, fire, special = action
+        if clearance(move, turn) >= 2 * radius + 20:
+            return action
+
+        options = [(0, -1), (0, 1), (0, 0)]
+        if lidar[0] > radius + 20:
+            options.extend(((1, -1), (1, 0), (1, 1)))
+        if lidar[6] > radius + 20:
+            options.extend(((-1, -1), (-1, 0), (-1, 1)))
+        nearest = min(nearby, key=lambda e: e.get("dist", 1e9))
+        away = math.atan2(y - nearest["y"], x - nearest["x"])
+        def score(candidate):
+            m, t = candidate
+            facing = angle + t * turn_speed * horizon
+            return (clearance(m, t), -abs(_wrap(away - facing)), m == move and t == turn)
+        move, turn = max(options, key=score)
+        self.mode = "AvoidTank"
+        return move, turn, fire, special
 
     def _act(self, state):
         me = state["me"]
@@ -93,7 +141,10 @@ class PhantomBot:
                       "scatter": 2 if not me.get("scatter_shots") else 0,
                       "mine": 1 if not me.get("mine_charges") else 0}
         for pickup in state.get("powerups", []):
-            if pickup.get("dist", 1e9) <= 250 and priorities.get(pickup.get("type"), 0):
+            contested = any(math.hypot(e["x"] - pickup["x"], e["y"] - pickup["y"]) < 180
+                            and math.hypot(e["x"] - pickup["x"], e["y"] - pickup["y"])
+                            <= pickup.get("dist", 1e9) + 50 for e in enemies)
+            if pickup.get("dist", 1e9) <= 250 and priorities.get(pickup.get("type"), 0) and not contested:
                 target = (pickup["x"], pickup["y"])
                 self.mode = "Pickup"
                 break

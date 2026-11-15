@@ -118,7 +118,8 @@ def api_open_bots_dir() -> Any:
 def api_prompt_guide() -> Any:
     if os.path.exists(PROMPT_MD):
         with open(PROMPT_MD, "r", encoding="utf-8") as f:
-            return jsonify({"ok": True, "markdown": f.read()})
+            md = f.read().replace(r"<你的解压目录>\bots", BOTS_DIR)
+            return jsonify({"ok": True, "markdown": md})
     return jsonify({"ok": False, "markdown": ""})
 
 

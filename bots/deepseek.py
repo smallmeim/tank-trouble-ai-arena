@@ -1,6 +1,6 @@
 """Prism: 以自建弹道模拟器为核心的生存+反弹狙击小车。
 
-核心思路（与「照文档拍脑袋」的做法不同，本脚本按仓库源码的真实参数实现）：
+核心思路（按仓库源码的真实参数实现，不是照文档拍脑袋）：
   1. 炮口实际在车体中心外 36px；贴墙时游戏会把出膛点压回墙内 4px，子弹随即
      反射回来——而 `selfHitGrace` 只在「未反弹」时生效，一旦反弹就能打死自己。
      所以贴墙开火等于自杀，本脚本把这一条做成硬门（第一段弹道 < 34px 一律不开火）。
@@ -12,6 +12,17 @@
   4. 开火三重门：炮口不被夹 → 弹道不会在 1.8s 内折返打到自己 → 确实能命中。
   5. 一次反弹用镜像法解析求解，二次反弹用角度扫描；持激光时按 4 次反弹全路径搜索
      （激光是 hitscan，命中半径 16，且首段跳过射手本人）。
+
+规则 v2 增量（车体互撞即双亡，护盾无效）：
+  6. 把「避撞」提到与躲弹同级的硬约束。决策链路 33ms 采样一次，240px/s 对冲时
+     一次决策就吃掉 8~16px，所以不能等靠到 32px 才动：
+       · 机动评分里对每辆 200px 内敌车做**含速度的运动预测**，预测进入 34px 直接
+         按「中弹」计价（+3200），34~47px 给二次方梯度；
+       · 62px 处再加一道**硬门**：正前方有车就禁止继续给 move=1，太近直接倒车，
+         并强制朝背离方向转向；正后方有车时同理禁止倒车撞上去。
+  7. 修正「贴脸硬顶」与「抢道具对撞」：瞄准动作在敌车 110px 内一律中断；抢同一件
+     道具时，若对方更近就直接把该道具价值打到 22%（让给他），绝不迎头换命。
+  8. 单帧只做 8×11×近身车数 的预测，无重循环、无第三方库，实测 ~0.6ms/帧。
 """
 
 from __future__ import annotations
@@ -37,8 +48,14 @@ SAMPLE_N = len(SAMPLE_T)
 MUZZLE = 36.0          # bodyLength/2 + barrelLength + shellRadius + 2
 TANK_R = 16.0
 SHELL_R = 3.0
-SHELL_V = 180.0        # 子弹速度（m/s 意义上的 px/s），arena 里也会给
+SHELL_V = 180.0        # 子弹速度（px/s），arena 里也会给
 HIT_R = TANK_R + SHELL_R   # 子弹命中半径 19
+
+# 车体互撞：中心距 <= 32 双方当场爆炸，护盾无效（规则 v2）。
+COL_KILL = 32.0        # 实际判死半径 = 2 * tank_radius
+COL_WARN = 34.0        # 预测进入此半径 -> 视为等同中弹
+COL_GATE = 62.0        # 硬门：这个距离内禁止朝对方继续给油
+COL_SENSE = 200.0      # 只对 200px 内敌车做运动预测，省算力
 
 PU_VALUE = {"shield": 0.98, "laser": 1.0, "scatter": 0.52, "mine": 0.34}
 
@@ -154,8 +171,8 @@ def _cast(px, py, dx, dy, rem, whv):
     return best, kind, gw
 
 
-class SpaceBunnyPrism:
-    """弹道几何 + 生存优先的混战小车。"""
+class PrismTank:
+    """弹道几何 + 生存优先 + 车体防撞的混战小车。"""
 
     name = "DeepSeek"
     author = "DeepSeek (Prism / 弹道几何·生存优先)"
@@ -169,6 +186,8 @@ class SpaceBunnyPrism:
         self.spd = 120.0
         self.tsp = 3.0
         self.foes = []
+        self.near_foes = []
+        self.nearest_foe = None
         self._reset()
 
     def _reset(self) -> None:
@@ -193,8 +212,9 @@ class SpaceBunnyPrism:
         self.prev_move = 1
         self.goal_s = None
         self.cell = 96.0
+        self.col_gate = 0
         # 交战几何：贴近到 approach_r 内就改成绕圈，环绕半径 engage_r。
-        # 混战里贴太近会被多方火力同时覆盖，所以宁可多留一点距离。
+        # 混战里贴太近会被多方火力同时覆盖，且新规则下贴脸就是互爆。
         self.approach_r = 420.0
         self.engage_r = 300.0
 
@@ -205,7 +225,6 @@ class SpaceBunnyPrism:
         try:
             return self._act(state)
         except Exception:
-            self.mode = "Err"
             return 0, 0, 0, 0
 
     # ------------------------------------------------------------------
@@ -237,15 +256,18 @@ class SpaceBunnyPrism:
         scatter = int(_num(me.get("scatter_shots")))
         mines = int(_num(me.get("mine_charges")))
         can_fire = bool(me.get("can_fire", False))
-        active = int(_num(me.get("active_shells")))
         lid = lidar
 
         if self.mine_cool > 0:
             self.mine_cool -= 1
+        if self.col_gate > 0:
+            self.col_gate -= 1
 
-        # 敌方位置记忆（用于拦截提前量）
+        # 敌方位置/速度（用于拦截提前量 + 车体防撞预测）
         self.foes = []
-        nd = 400.0
+        self.near_foes = []
+        nearest = None
+        nearest_d = 1e9
         for e in state.get("enemies") or ():
             if not e.get("alive", True):
                 continue
@@ -254,10 +276,18 @@ class SpaceBunnyPrism:
             eid = e.get("id", id(e))
             vx, vy = self._enemy_vel(eid, ex, ey)
             self.foes.append((ex, ey, bool(e.get("shield", False)), vx, vy))
-            dd = math.hypot(ex - mx, ey - my)
-            if dd < nd:
-                nd = dd
-        self.near_dist = max(60.0, nd)
+            d = math.hypot(ex - mx, ey - my)
+            if d < nearest_d:
+                nearest_d = d
+                nearest = (ex, ey, d)
+            if d <= COL_SENSE:
+                sp = math.hypot(vx, vy)
+                if sp > 130.0:            # 预测速度封顶，防噪点把预测甩飞
+                    vx *= 130.0 / sp
+                    vy *= 130.0 / sp
+                self.near_foes.append((ex, ey, vx, vy))
+        self.nearest_foe = nearest
+        self.near_dist = max(60.0, nearest_d)
 
         # --------------------------------------------------------------
         # 1) 卡墙检测 / 脱困
@@ -331,7 +361,9 @@ class SpaceBunnyPrism:
         # --------------------------------------------------------------
         # 5) 机动
         # --------------------------------------------------------------
-        if self.aim_angle is not None and urgent < 0.20 and self.aim_hold < 24:
+        # 敌车压到 110px 内就不再站桩瞄准：换命比打中更亏
+        if (self.aim_angle is not None and urgent < 0.20
+                and self.aim_hold < 24 and self.near_dist > 110.0):
             # 精细瞄准走直连转向：机动评分器的时间视界太粗，小角度误差会被
             # 「转过头的惩罚」压住，导致永远转不到位、一炮不开。
             err = _wrap(self.aim_angle - ang)
@@ -359,6 +391,26 @@ class SpaceBunnyPrism:
             )
 
         # --------------------------------------------------------------
+        # 5.5) 车体防撞硬门（规则 v2：接触即双方阵亡，护盾无效）
+        #      68px 内正前方有车还继续给油，一次 33ms 决策就足以撞上。
+        # --------------------------------------------------------------
+        if self.nearest_foe is not None and self.nearest_foe[2] < COL_GATE:
+            fx, fy, fd = self.nearest_foe
+            rel = _wrap(math.atan2(fy - my, fx - mx) - ang)
+            if abs(rel) < 1.25 and move == 1:
+                # 正前方有车：先停，太近直接倒车，并朝背离方向打死
+                move = -1 if fd < 50.0 else 0
+                turn = -1 if rel > 0.0 else 1
+                self.aim_angle = None
+                self.col_gate = 9
+            elif abs(rel) > 2.0 and move == -1:
+                # 正后方有车还倒车 = 主动撞上去
+                move = 0
+                turn = 1 if rel > 0.0 else -1
+                self.aim_angle = None
+                self.col_gate = 9
+
+        # --------------------------------------------------------------
         # 6) 布雷
         # --------------------------------------------------------------
         special = 0
@@ -369,6 +421,8 @@ class SpaceBunnyPrism:
 
         if fire:
             self.mode = "开火"
+        elif self.col_gate > 0:
+            self.mode = "避撞"
         elif urgent > 0.35:
             self.mode = "闪避"
         elif self.aim_angle is not None:
@@ -397,7 +451,7 @@ class SpaceBunnyPrism:
         return self.goal_s
 
     # ------------------------------------------------------------------
-    # 敌人速度估计（用于提前量）
+    # 敌人速度估计（用于提前量 + 防撞预测）
     # ------------------------------------------------------------------
     def _enemy_vel(self, eid, x, y):
         prev = self.mem.get(eid)
@@ -491,7 +545,7 @@ class SpaceBunnyPrism:
             if tr is None:
                 continue
             tracks.append(tr)
-            # 紧急度：0.55s 内最近距离
+            # 紧急度：0.58s 内最近距离
             for i, t in enumerate(SAMPLE_T):
                 if t > 0.58:
                     break
@@ -727,13 +781,21 @@ class SpaceBunnyPrism:
                 w = 0.20
             elif ptype == "mine" and mines > 0:
                 w = 0.14
-            pd = math.hypot(_num(pu.get("x")) - mx, _num(pu.get("y")) - my)
+            pux = _num(pu.get("x"))
+            puy = _num(pu.get("y"))
+            pd = math.hypot(pux - mx, puy - my)
             if pd > 560.0:
                 continue
             val = w / (70.0 + pd)
+            # 抢同一件道具时不要迎面换命：对方明显更近就让给他（新规则下对撞双亡）
+            for fx, fy, _sh, _vx, _vy in self.foes:
+                fd = math.hypot(fx - pux, fy - puy)
+                if fd < 120.0 and fd + 45.0 < pd:
+                    val *= 0.22
+                    break
             if val > best_val:
                 best_val = val
-                best = (_num(pu.get("x")), _num(pu.get("y")))
+                best = (pux, puy)
 
         has_target = best is not None and best_val > 0.0011
 
@@ -752,7 +814,8 @@ class SpaceBunnyPrism:
             d = math.hypot(ex - mx, ey - my)
             if d > self.approach_r:
                 return self._path_heading(mx, my, ex, ey, state), 12.0
-            # 绕圈走位：目标点取敌人外侧 engage_r、偏约 0.95rad 的位置，形成环绕
+            # 绕圈走位：目标点取敌人外侧 engage_r、偏约 0.95rad 的位置，形成环绕。
+            # 环绕而非直冲，天然保持中距，避免把自己送进 32px 的互爆半径。
             if self.tick - self.strafe_tick > 110:
                 self.strafe_tick = self.tick
                 self.strafe = -self.strafe
@@ -826,6 +889,7 @@ class SpaceBunnyPrism:
         best_score = -1e9
         threat_w = 90.0 if not shield else 55.0
         goal_w = goal_w * (1.0 if urgent < 0.2 else max(0.0, 1.0 - urgent * 1.6))
+        near_foes = self.near_foes
 
         for move, turn in MANEUVERS:
             pos = [self._motion(mx, my, ang, move, turn, t) for t in SAMPLE_T]
@@ -843,6 +907,25 @@ class SpaceBunnyPrism:
                         pen += (R - d) * (R - d) * (1.0 - i * 0.05)
             if pen > 0.0:
                 pen *= threat_w * 0.06
+
+            # —— 车体互撞（规则 v2：接触即双亡，护盾无效）——
+            # 对每辆近身车按它的实测速度外推，逐时间片比对我这条机动会走到哪。
+            for fx, fy, fvx, fvy in near_foes:
+                for i in range(1, SAMPLE_N):
+                    t = SAMPLE_T[i]
+                    ex = fx + fvx * t
+                    ey = fy + fvy * t
+                    px, py = pos[i]
+                    dx = px - ex
+                    dy = py - ey
+                    d2 = dx * dx + dy * dy
+                    lim = 46.0 + 20.0 * t
+                    if d2 < lim * lim:
+                        d = math.sqrt(d2)
+                        if d < COL_WARN and t < 0.65:
+                            pen += 3200.0      # 不可逆：等同中弹，任何收益都不值
+                        else:
+                            pen += (lim - d) * (lim - d) * 1.4
 
             # —— 地雷 ——
             for nmx, nmy, armed in mines_hz:
