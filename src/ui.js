@@ -885,35 +885,58 @@ export function renderHud(ctx, { players, matchScores, isPlaying, challenge, wav
     return;
   }
 
-  for (let i = 0; i < players.length; i++) {
-    const p = players[i];
-    const left = i === 0;
-    const x = left ? 20 : CANVAS.width - 20;
-    ctx.textAlign = left ? "left" : "right";
+  if (players.length > 2) {
+    // Multi-tank AI Melee HUD: evenly distribute 3..6 colored tank chips across the top bar
+    const slotW = (CANVAS.width - 32) / players.length;
+    ctx.font = "bold 14px system-ui, 'Microsoft YaHei', sans-serif";
+    for (let i = 0; i < players.length; i++) {
+      const p = players[i];
+      const cx = 16 + slotW * (i + 0.5);
+      const score = matchScores[i] ?? 0;
+      const shortName = String(p.label || `P${i + 1}`).slice(0, 10);
+      const labelTxt = `${shortName} ${score}${p.alive ? "" : " ✕"}`;
+      const tw = ctx.measureText(labelTxt).width;
+      const dotX = cx - tw / 2 - 9;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(dotX, y, 5.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.textAlign = "left";
+      ctx.fillStyle = p.alive ? THEME.textMain : THEME.textDim;
+      ctx.fillText(labelTxt, dotX + 10, y);
+    }
+    ctx.textAlign = "left";
+  } else {
+    for (let i = 0; i < players.length; i++) {
+      const p = players[i];
+      const left = i === 0;
+      const x = left ? 20 : CANVAS.width - 20;
+      ctx.textAlign = left ? "left" : "right";
 
-    // 色块标记（左侧玩家在最左，右侧玩家在最右）
-    ctx.fillStyle = p.color;
-    ctx.beginPath();
-    ctx.arc(left ? x + 7 : x - 7, y, 7, 0, Math.PI * 2);
-    ctx.fill();
+      // 色块标记（左侧玩家在最左，右侧玩家在最右）
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(left ? x + 7 : x - 7, y, 7, 0, Math.PI * 2);
+      ctx.fill();
 
-    // 名称 + 累计比分 + 状态。比分紧跟名字，左玩家「P1 3」右玩家「3 P2」。
-    ctx.fillStyle = p.alive ? THEME.textMain : THEME.textDim;
-    const score = matchScores[i];
-    // 阵亡标记朝「远离中线」的一侧排，左右对称不粘连
-    const text = left
-      ? `${p.label}  ${score}${p.alive ? "" : "  阵亡"}`
-      : `${p.alive ? "" : "阵亡  "}${score}  ${p.label}`;
-    const tx = left ? x + 22 : x - 22;
-    ctx.fillText(text, tx, y);
+      // 名称 + 累计比分 + 状态。比分紧跟名字，左玩家「P1 3」右玩家「3 P2」。
+      ctx.fillStyle = p.alive ? THEME.textMain : THEME.textDim;
+      const score = matchScores[i];
+      // 阵亡标记朝「远离中线」的一侧排，左右对称不粘连
+      const text = left
+        ? `${p.label}  ${score}${p.alive ? "" : "  阵亡"}`
+        : `${p.alive ? "" : "阵亡  "}${score}  ${p.label}`;
+      const tx = left ? x + 22 : x - 22;
+      ctx.fillText(text, tx, y);
 
-    // —— 武器/护盾徽章：接在文字末端向中线方向排 ——
-    // 武器槽互斥（scatter/laser/mine 三选一）→ 最多 1 武器徽章 + 1 护盾徽章
-    const textW = ctx.measureText(text).width;
-    let bx = left ? tx + textW + 22 : tx - textW - 22; // 首枚徽章圆心
-    const step = left ? 26 : -26;                       // 后续徽章间距（朝中线）
-    renderWeaponBadges(ctx, p.tank, bx, y, step);
-    ctx.font = "bold 18px system-ui, 'Microsoft YaHei', sans-serif"; // 徽章角标改过字体，还原
+      // —— 武器/护盾徽章：接在文字末端向中线方向排 ——
+      // 武器槽互斥（scatter/laser/mine 三选一）→ 最多 1 武器徽章 + 1 护盾徽章
+      const textW = ctx.measureText(text).width;
+      let bx = left ? tx + textW + 22 : tx - textW - 22; // 首枚徽章圆心
+      const step = left ? 26 : -26;                       // 后续徽章间距（朝中线）
+      renderWeaponBadges(ctx, p.tank, bx, y, step);
+      ctx.font = "bold 18px system-ui, 'Microsoft YaHei', sans-serif"; // 徽章角标改过字体，还原
+    }
   }
 
   // 对战中底部提示：可随时按 Esc 退回菜单（仅 PLAYING 显示；
@@ -1036,22 +1059,32 @@ export function renderMatchOverBanner(ctx, { winner, matchScores, players, mouse
   ctx.font = "bold 56px system-ui, 'Microsoft YaHei', sans-serif";
   ctx.fillText(`${winner.label} 赢得本场`, cx, 268);
 
-  // 大比分：双方各自玩家色（左分-冒号-右分三段分别绘制，色彩对位）
-  ctx.font = "bold 44px system-ui, sans-serif";
-  ctx.fillStyle = players[0].color;
-  ctx.fillText(String(matchScores[0]), cx - 56, 348);
-  ctx.fillStyle = THEME.textDim;
-  ctx.fillText(":", cx, 344);
-  ctx.fillStyle = players[1].color;
-  ctx.fillText(String(matchScores[1]), cx + 56, 348);
-
-  // 本场命中率（双方都开过火才显示）
-  const acc = matchAccuracy;
-  if (acc && (acc[0] !== null || acc[1] !== null)) {
-    const fmt = (a) => (a === null ? "—" : `${Math.round(a * 100)}%`);
+  if (players.length > 2) {
+    const ranked = players
+      .map((p, idx) => ({ p, score: matchScores[idx] ?? 0 }))
+      .sort((a, b) => b.score - a.score);
+    ctx.font = "bold 20px system-ui, 'Microsoft YaHei', sans-serif";
+    const summary = ranked.map((r) => `${r.p.label} ${r.score}分`).join("   ·   ");
+    ctx.fillStyle = THEME.textMain;
+    ctx.fillText(summary, cx, 348);
+  } else {
+    // 大比分：双方各自玩家色（左分-冒号-右分三段分别绘制，色彩对位）
+    ctx.font = "bold 44px system-ui, sans-serif";
+    ctx.fillStyle = players[0].color;
+    ctx.fillText(String(matchScores[0]), cx - 56, 348);
     ctx.fillStyle = THEME.textDim;
-    ctx.font = "15px system-ui, 'Microsoft YaHei', sans-serif";
-    ctx.fillText(`本场命中率　${players[0].label} ${fmt(acc[0])} · ${players[1].label} ${fmt(acc[1])}`, cx, 398);
+    ctx.fillText(":", cx, 344);
+    ctx.fillStyle = players[1].color;
+    ctx.fillText(String(matchScores[1]), cx + 56, 348);
+
+    // 本场命中率（双方都开过火才显示）
+    const acc = matchAccuracy;
+    if (acc && (acc[0] !== null || acc[1] !== null)) {
+      const fmt = (a) => (a === null ? "—" : `${Math.round(a * 100)}%`);
+      ctx.fillStyle = THEME.textDim;
+      ctx.font = "15px system-ui, 'Microsoft YaHei', sans-serif";
+      ctx.fillText(`本场命中率　${players[0].label} ${fmt(acc[0])} · ${players[1].label} ${fmt(acc[1])}`, cx, 398);
+    }
   }
 
   // 按钮（白底 hover 主题色，同暂停浮层风格）

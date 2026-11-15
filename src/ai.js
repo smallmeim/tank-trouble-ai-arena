@@ -331,8 +331,17 @@ export class AiController {
     const idle = { turn: 0, move: 0, fire: false, special: false };
     if (!self.alive) return idle;
 
-    // 目标：场上另一个存活玩家（1v1 就一个；没有则待机）
-    const enemyPlayer = world.players.find((p) => p !== this.player && p.alive);
+    // 目标：距离自己最近的存活敌方玩家（1v1 等价于唯一对手，混战自动锁最近目标）
+    let enemyPlayer = null;
+    let bestEnemyDist = Infinity;
+    for (const p of world.players) {
+      if (p === this.player || !p.alive) continue;
+      const d = Math.hypot(p.tank.x - self.x, p.tank.y - self.y);
+      if (d < bestEnemyDist) {
+        bestEnemyDist = d;
+        enemyPlayer = p;
+      }
+    }
     if (!enemyPlayer) return idle;
     const enemy = enemyPlayer.tank;
     const enemyDist = Math.hypot(enemy.x - self.x, enemy.y - self.y);

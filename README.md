@@ -1,4 +1,19 @@
-# 坦克回廊 | Tank Trouble
+# 坦克回廊 · AI 代码混战版 | Tank Trouble AI Code Arena
+
+基于开源项目 [`AbyssWhalen/tank-trouble`](https://github.com/AbyssWhalen/tank-trouble) 扩展改造的多模型 Python AI 小车同场混战版。
+
+> **AI Code Arena Extension**: Built on top of [`AbyssWhalen/tank-trouble`](https://github.com/AbyssWhalen/tank-trouble) (MIT License) with a Flask + Python bot bridge (`server.py`, `py_maze_helpers.py`, `bots/*.py`) so 2–6 AI-written Python tank scripts can battle each other alongside human players and built-in JS AIs.
+
+### 快速启动 AI 代码混战 | Quick Start (Python AI Arena)
+
+1. 安装依赖（Python 3.10+）：`pip install flask`
+2. 启动服务并打开浏览器：`python server.py --open`（Windows 可直接双击 `launch_arena.bat`）
+3. 将任意大模型编写的 `.py` 小车放入 `bots/` 目录（写作规范与提示词见 [`PROMPT_FOR_OTHER_AI.md`](./PROMPT_FOR_OTHER_AI.md)），在页面顶部点击 **「🔄 刷新 bots/」** 后即可给 1~6 号车分别指派不同 AI 模型脚本开打。
+4. 运行校验：`node scripts/smoke.mjs` 与 `python -m unittest discover -s tests -v`。
+
+---
+
+# 坦克回廊 | Tank Trouble (原版说明)
 
 本地多人对战坦克小游戏，迷宫随机生成 + 子弹反弹 + 人机 AI。
 

@@ -71,6 +71,9 @@ import {
   loadStats, saveStats, getStats, accuracy, accuracyDelta, favoriteWeapon,
   recordFired, recordHit, recordKill, recordRoundEnd, recordMatchWin,
 } from "./stats.js";
+import {
+  setupPyBridgeUI, notifyPyRoundStart, stepPyBridge, createPyController,
+} from "./py_bot_bridge.js";
 
 const canvas = document.getElementById("game-canvas");
 const ctx = canvas.getContext("2d");
@@ -83,11 +86,12 @@ function setupCanvas() {
   const dpr = window.devicePixelRatio || 1;
   canvas.width = CANVAS.width * dpr;
   canvas.height = CANVAS.height * dpr;
-  // 窗口装得下用原尺寸(scale=1)，装不下等比缩到正好放下（兜底 || 防 stub 环境无 innerWidth）
+  // 窗口装得下用原尺寸(scale=1)，装不下等比缩到正好放下（留出顶部 AI 混战工具栏 46px）
+  const topReserve = typeof document !== "undefined" && document.getElementById("py-arena-ui") ? 48 : 0;
   const fit = Math.min(
     1,
     (window.innerWidth || CANVAS.width) / CANVAS.width,
-    (window.innerHeight || CANVAS.height) / CANVAS.height
+    Math.max(240, (window.innerHeight || CANVAS.height) - topReserve) / CANVAS.height
   );
   canvas.style.width = CANVAS.width * fit + "px";
   canvas.style.height = CANVAS.height * fit + "px";
@@ -191,6 +195,12 @@ const wallBreakActive = () => (currentMode === "challenge" ? levelWallBreak : wa
 // 单人模式（挑战/波次）：players 长度可变、战绩口径与 1v1 不同 →
 // 不进终身统计（stats.players 定长 2，第三车会越界），慢镜只在终局（见 pendingSoloSlowmo）
 const soloMode = () => currentMode === "challenge" || currentMode === "wave";
+const isPyMelee = () => currentMode === "py_melee";
+const MELEE_COLORS = [PLAYER_COLORS[0], ...ENEMY_COLORS];
+let pyMeleeSlots = [];
+let pyRoundId = 1;
+let lastWallCount = 0;
+let wallVersion = 1;
 // 本关的限时/生存秒数上限（0 = 不限时的歼灭关）。HUD 读它算剩余秒数——
 // 秒数字段的解析只在 objectiveOf 一处，别在 HUD 里再拆 mutators
 const challengeSecs = () => objectiveOf(LEVELS[currentLevelIndex]).secs ?? 0;
@@ -334,12 +344,43 @@ window.__devHook = {
 // 开一整场：从菜单进入时调用。清零累计分，再开第一回合。
 // 与 setupRound 的分工：startMatch 负责「整场」级状态(分数)，
 // setupRound 只负责「单回合」级状态(地图/玩家)。回合重开只走 setupRound，分数不动。
-function startMatch(mode) {
-  matchScores = [0, 0];
-  // 本场命中率基线：整场结算横幅显示的是「本场」而非终身累计，
-  // 记开场时的 fired/hits，MATCH_OVER 处做差
-  matchStatsBase = getStats().players.map((p) => ({ fired: p.fired, hits: p.hits }));
+function startMatch(mode, extraSlots = null) {
+  if (mode === "py_melee") {
+    if (Array.isArray(extraSlots) && extraSlots.length >= 2) {
+      pyMeleeSlots = extraSlots.slice(0, 6);
+    }
+    const n = Math.max(2, pyMeleeSlots.length || 2);
+    matchScores = new Array(n).fill(0);
+    matchStatsBase = null;
+  } else {
+    matchScores = [0, 0];
+    // 本场命中率基线：整场结算横幅显示的是「本场」而非终身累计，
+    // 记开场时的 fired/hits，MATCH_OVER 处做差
+    matchStatsBase = getStats().players.map((p) => ({ fired: p.fired, hits: p.hits }));
+  }
   setupRound(mode);
+}
+
+function pickMeleeSpawns(m, count) {
+  const half = CELL_SIZE / 2;
+  const cx = (m.cols * CELL_SIZE) / 2;
+  const cy = (m.rows * CELL_SIZE) / 2;
+  const anchors = [
+    { c: 0, r: 0 },
+    { c: m.cols - 1, r: m.rows - 1 },
+    { c: m.cols - 1, r: 0 },
+    { c: 0, r: m.rows - 1 },
+    { c: Math.floor(m.cols / 2), r: 0 },
+    { c: Math.floor(m.cols / 2), r: m.rows - 1 },
+  ];
+  const pts = [];
+  for (let i = 0; i < count; i++) {
+    const cell = anchors[i % anchors.length];
+    const x = cell.c * CELL_SIZE + half;
+    const y = cell.r * CELL_SIZE + half;
+    pts.push({ x, y, a: Math.atan2(cy - y, cx - x) });
+  }
+  return pts;
 }
 
 // 生成地图 + 算自适应缩放 + 返回四角出生位。
@@ -385,6 +426,9 @@ function setupRound(mode) {
   } else if (mode === "wave") {
     // 波次：档位是难度（曲线确定性给，第 11 波起 large），风格仍是花样（随机）
     corner = buildArena(waveSpec(1).tier, pickStyle(mode));
+  } else if (mode === "py_melee") {
+    const n = Math.max(2, Math.min(6, pyMeleeSlots.length || 2));
+    corner = buildArena(n >= 5 ? "large" : "medium", pickStyle("pvp"));
   } else {
     // 从该模式的档位池随机抽一档（pvp/pve → small|medium）
     const pool = TIER_POOL_BY_MODE[mode] || TIER_POOL_BY_MODE.pvp;
@@ -426,6 +470,33 @@ function setupRound(mode) {
     // 强化是 run 级资产：重来就归零。坦克本体是新建的 → mods 天然中性，
     // 这里只需要清「抽过什么」的账本（HUD 强化条与抽卡池都读它）。
     taken.clear();
+  } else if (mode === "py_melee") {
+    const slots = pyMeleeSlots.length >= 2
+      ? pyMeleeSlots
+      : [{ controller: "py:example_bouncer", label: "BankSniper" }, { controller: "py:example_dodger", label: "GhostDodger" }];
+    const spawns = pickMeleeSpawns(maze, slots.length);
+    players = slots.map((slot, i) => {
+      const sp = spawns[i];
+      const col = MELEE_COLORS[i % MELEE_COLORS.length];
+      const cid = String(slot.controller || "github:normal");
+      if (cid === "human1") {
+        return new Player(i, col, KEY_BINDINGS[0], sp.x, sp.y, sp.a, false, "normal", null, slot.label || "玩家1");
+      }
+      if (cid === "human2") {
+        return new Player(i, col, KEY_BINDINGS[1], sp.x, sp.y, sp.a, false, "normal", null, slot.label || "玩家2");
+      }
+      if (cid.startsWith("github:")) {
+        const lvl = cid.split(":")[1] || "normal";
+        return new Player(i, col, null, sp.x, sp.y, sp.a, true, lvl, null, slot.label || `原版(${lvl})`);
+      }
+      const pyCtrl = createPyController(i, cid);
+      return new Player(i, col, null, sp.x, sp.y, sp.a, true, "normal", pyCtrl, slot.label || cid.replace("py:", ""));
+    });
+    pyRoundId++;
+    wallVersion = 1;
+    lastWallCount = maze.walls.length;
+    notifyPyRoundStart(pyRoundId, maze, wallVersion);
+    spawner = new PowerupSpawner(POWERUP.types.filter((t) => enabledPowerups.has(t)));
   } else {
     // P1 左上角格朝右，P2 右下角格朝左，初始背对，给彼此反应空间。
     // pve 模式 P2 是 AI：keys=null + isAI=true，Player 内建 AiController。
@@ -742,7 +813,7 @@ function hitPlayer(p, weapon, killerTank) {
     effects.push(new ShieldBreak(p.tank.x, p.tank.y, THEME.shieldRing));
     addShake(3, 0.2);
     playSfx("shieldBreak");
-    if (!soloMode() && killerIndex >= 0 && killerTank !== p.tank) recordHit(killerIndex, weapon);
+    if (!soloMode() && !isPyMelee() && killerIndex >= 0 && killerTank !== p.tank) recordHit(killerIndex, weapon);
     return false;
   }
   p.tank.alive = false;
@@ -755,9 +826,9 @@ function hitPlayer(p, weapon, killerTank) {
   effects.push(new TankExplosion(p.tank.x, p.tank.y, p.color));
   addShake(5, 0.3);
   playSfx("kill");
-  if (!soloMode()) slowmoTimer = SLOWMO.duration; // 1v1 任何击杀=终杀
-  else pendingSoloSlowmo = true; // 单人模式：是否终局由胜负段确认后再慢镜
-  if (!soloMode() && killerIndex >= 0 && killerTank !== p.tank) recordKill(killerIndex, weapon);
+  if (!soloMode() && !isPyMelee()) slowmoTimer = SLOWMO.duration; // 1v1 任何击杀=终杀
+  else pendingSoloSlowmo = true; // 单人/混战模式：是否终局由胜负段确认后再慢镜
+  if (!soloMode() && !isPyMelee() && killerIndex >= 0 && killerTank !== p.tank) recordKill(killerIndex, weapon);
   // 波次战绩：敌人被击破就 +1（含互相误伤/踩雷——场是你控的，算你的）
   if (currentMode === "wave" && p !== players[0]) {
     waveKills++;
@@ -814,6 +885,13 @@ function updatePlaying(dt) {
   // 1) 收集本帧所有玩家的控制指令（人读键盘 / AI 决策），与执行分离——
   //    保持"先全员移动、再全员开火"的原有顺序，也让 AI 看到的是同一帧的世界
   const world = { maze, players, bullets, powerups, mines };
+  if (isPyMelee()) {
+    if (maze.walls.length !== lastWallCount) {
+      lastWallCount = maze.walls.length;
+      wallVersion++;
+    }
+    stepPyBridge(dt, world, players, pyRoundId, wallVersion);
+  }
   const controls = players.map((p) => p.getControls(dt, world));
 
   // 2) 每辆坦克按指令移动转向 + 冷却
@@ -909,11 +987,11 @@ function updatePlaying(dt) {
       effects.push(new MuzzleFlash(res.bullets[0].x, res.bullets[0].y, players[i].tank.angle));
       playSfx(res.bullets.length > 1 ? "shootScatter" : "shoot"); // 散射一炮一个音
       // 单人模式不进终身统计（stats.players 定长 2，第三车会越界；口径也不同）
-      if (!soloMode()) recordFired(i, res.bullets.length);
+      if (!soloMode() && !isPyMelee()) recordFired(i, res.bullets.length);
     }
     for (const b of res.bullets) bullets.push(b); // kind 已由 tank.spawnBullet 打好
     if (res.laser) {
-      if (!soloMode()) recordFired(i, 1);
+      if (!soloMode() && !isPyMelee()) recordFired(i, 1);
       fireLaser(res.laser, players[i]); // 补传射手，击杀归属统计
     }
 
@@ -1012,22 +1090,25 @@ function updatePlaying(dt) {
     return;
   }
 
-  // pvp/pve：存活 ≤1 转结算
+  // pvp/pve/py_melee：存活 ≤1 转结算
   const alivePlayers = players.filter((p) => p.alive);
   if (alivePlayers.length <= 1) {
     winner = alivePlayers.length === 1 ? alivePlayers[0] : null;
     // 计分：转 ROUND_OVER 这一帧加一次（同归于尽 winner=null 不加分）。
     // 状态切走后不再进 updatePlaying，天然只触发一次，无需额外加锁。
     if (winner) matchScores[winner.index]++;
-    recordRoundEnd(winner ? winner.index : null); // 胜场 + P1 连胜推进
+    if (isPyMelee()) slowmoTimer = SLOWMO.duration;
+    else recordRoundEnd(winner ? winner.index : null); // 胜场 + P1 连胜推进
     if (winner && matchScores[winner.index] >= MATCH_TARGET) {
       // 先到局胜分：整场结束，大横幅等玩家选择（无自动倒计时）
-      recordMatchWin(winner.index);
-      saveStats();
+      if (!isPyMelee()) {
+        recordMatchWin(winner.index);
+        saveStats();
+      }
       state = STATE.MATCH_OVER;
       playSfx("matchWin");
     } else {
-      saveStats(); // 回合级也落盘，防中途退出丢统计（每回合一次全量写可接受）
+      if (!isPyMelee()) saveStats(); // 回合级也落盘，防中途退出丢统计（每回合一次全量写可接受）
       roundOverTimer = ROUND_RESTART_DELAY; // 启动自动重开倒计时
       state = STATE.ROUND_OVER;
       playSfx(winner ? "roundWin" : "roundDraw"); // 状态切走后不再进本函数，天然只播一次
@@ -1508,9 +1589,9 @@ function render() {
         // 算式与钳位都收在 stats.accuracyDelta 一处——原先这里是内联的一份，
         // 与 stats.accuracy 的钳位不同步，于是同一个游戏里「终身 ≤100%」而
         // 「本场 200%」。地雷口径见 stats.js 头部。
-        matchAccuracy: matchStatsBase
+        matchAccuracy: !isPyMelee() && matchStatsBase
           ? getStats().players.map((p, i) => accuracyDelta(p, matchStatsBase[i]))
-          : [null, null],
+          : players.map(() => null),
       });
       break;
     case STATE.LEVEL_OVER:
@@ -1595,6 +1676,29 @@ function renderArena() {
   // 子弹在坦克下层
   for (const b of bullets) b.render(ctx);
   for (const p of players) p.tank.render(ctx);
+  if (isPyMelee()) {
+    ctx.save();
+    ctx.font = "600 11px system-ui, -apple-system, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (const p of players) {
+      if (!p.alive || !p.label) continue;
+      const t = p.tank;
+      const ly = t.y - TANK.radius - 13;
+      const pw = ctx.measureText(p.label).width + 10;
+      ctx.fillStyle = "rgba(17, 24, 39, 0.80)";
+      ctx.strokeStyle = p.color || "#94a3b8";
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(t.x - pw / 2, ly - 8, pw, 16, 4);
+      else ctx.rect(t.x - pw / 2, ly - 8, pw, 16);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#f8fafc";
+      ctx.fillText(p.label, t.x, ly);
+    }
+    ctx.restore();
+  }
   // 波次生存：敌方坦克头顶画小号武器图标（阶段 25 词条层的可读性配套）。
   // **这是故意引入的信息不对称**：pvp/pve 里看不到对手的改装槽，别当 bug 修回去。
   // 理由是波次生存的 1v3 里敌人装备是每辆车独立抽的，同屏 3 辆哪辆是激光兵必须
@@ -1637,5 +1741,7 @@ function renderArena() {
     } : null,
   });
 }
+
+setupPyBridgeUI({ onStartMelee: (slots) => startMatch("py_melee", slots) });
 
 requestAnimationFrame(loop);

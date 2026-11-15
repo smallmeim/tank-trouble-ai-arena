@@ -16,14 +16,15 @@ export class Player {
   // x, y, angle: 出生位姿，用于创建坦克
   // isAI:  是否由 AI 控制（true 时内建 AiController，忽略 keys）
   // aiLevel: AI 难度档位 key（AI_DIFFICULTY 的 easy/normal/hard），仅 isAI 时生效
-  constructor(index, color, keys, x, y, angle, isAI = false, aiLevel = "normal") {
+  constructor(index, color, keys, x, y, angle, isAI = false, aiLevel = "normal", customCtrl = null, customLabel = null) {
     this.index = index;
     this.color = color;
     this.keys = keys;
     this.isAI = isAI;
+    this.customLabel = customLabel;
 
     this.tank = new Tank(x, y, angle, color);
-    this.ai = isAI ? new AiController(this, aiLevel) : null;
+    this.ai = customCtrl ? customCtrl : (isAI ? new AiController(this, aiLevel) : null);
   }
 
   // 本帧控制指令：AI 走控制器决策，人类读键盘。
@@ -36,8 +37,9 @@ export class Player {
     return this.tank.alive;
   }
 
-  // 显示用名字：P1 / P2 ...；AI 玩家标注一下
+  // 显示用名字：P1 / P2 ...；若有自定义 AI 名字优先显示
   get label() {
+    if (this.customLabel) return this.customLabel;
     const base = `P${this.index + 1}`;
     return this.isAI ? `${base}(AI)` : base;
   }
