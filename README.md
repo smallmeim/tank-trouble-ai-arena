@@ -14,7 +14,7 @@
 
 ### 第 2 步：下载游戏压缩包
 1. 打开本仓库右侧（或顶部）的 **[Releases 页面](https://github.com/smallmeim/tank-trouble-ai-arena/releases/latest)**。
-2. 在 `Assets` 栏点击下载 **`tank-trouble-ai-arena-v1.1.0.zip`**（不要只下载 `Source code` 源码，直接用打包好的压缩包即可，或者下载任意最新 `.zip`）。
+2. 在 `Assets` 栏点击下载 **`tank-trouble-ai-arena-v1.2.0.zip`**（不要只下载 `Source code` 源码，直接用打包好的压缩包即可，或者下载任意最新 `.zip`）。
 3. 右键下载好的压缩包，选择 **「全部解压缩」** 到电脑任意文件夹（例如 `D:\Games\tank-trouble-ai-arena`）。
 
 ### 第 3 步：一键启动（可选生成桌面图标）
@@ -42,9 +42,13 @@
 
 ## 本版新增混战规则亮点
 
+- **🦗 无限斗蛐蛐（无尽死亡竞赛）**：点击顶部 **「🦗 无限斗蛐蛐」** 即可让当前 `bots/*.py` 全员同时上场混战：
+  - 击杀对手 `+1` 分，自己的普通弹/散射弹打中自己 `-1` 分，双车碰撞均死亡不加减分；
+  - 阵亡后可按顶部 **「复活 - / 秒数 / +」（`0~60s`，默认 `10s`，自动记住配置）** 在安全随机空格复活，并获得 **开火或放雷即立刻取消的无敌帧**；
+  - 顶部支持 **「倍速: 1x / 2x / 3x」** 加速观战，且迷宫内墙在无限模式下不可破坏，避免长时间激战变成空地。
 - **两车碰撞双方死亡**：在对战与 AI 混战模式下，两辆存活坦克发生车体接触（中心距 `<= 32 px`）时**双方均会直接爆炸死亡**，且**护盾无法免除撞死**。
 - **动态破墙与四种道具**：延续原版散射、护盾、反弹激光、隐形地雷与内墙炸毁同步，Python AI 通过 `helpers` 实时获取破墙后的最短路径与反弹轨迹。
-- **开发者校验命令**：`node scripts/smoke.mjs`、`node tests/test_collision_rule.mjs`、`python -m unittest discover -s tests -v`。
+- **开发者校验命令**：`node scripts/smoke.mjs`、`node tests/test_collision_rule.mjs`、`node tests/test_cricket_mode.mjs`、`python -m unittest discover -s tests -v`。
 
 ---
 

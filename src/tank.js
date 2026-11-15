@@ -33,6 +33,7 @@ export class Tank {
     this.mineHoldTimer = 0;  // 持雷超时计时（秒）：归零清空存货，部署/拾取时刷新
     this.shield = false;     // 是否持有护盾（挡一次致命伤害）
     this.shieldTimer = 0;    // 护盾剩余时间（秒），到点自动消失防一直龟
+    this.invulnTimer = 0;    // 复活无敌帧剩余秒数，一旦发起攻击立即清零
 
     // —— 实例数值倍率（阶段 25 波次生存的强化/词条挂点）——
     // 中性初值 = 原常量行为，所以 pvp/pve/challenge 三个模式一个字不用改。
@@ -40,10 +41,30 @@ export class Tank {
     this.mods = neutralMods();
   }
 
+  /** Respawn this tank in-place at (x, y, angle) while preserving object identity for projectile ownership. */
+  resetAt(x, y, angle, invulnSeconds = 0) {
+    this.x = x;
+    this.y = y;
+    this.angle = angle;
+    this.alive = true;
+    this.cooldown = 0;
+    this.deployCooldown = 0;
+    this.scatterShots = 0;
+    this.laserShots = 0;
+    this.mineCharges = 0;
+    this.mineHoldTimer = 0;
+    this.shield = false;
+    this.shieldTimer = 0;
+    this.invulnTimer = Math.max(0, invulnSeconds);
+  }
+
   // dt: 距上一帧的秒数；walls: 墙线段数组，用于撞墙不穿
   // controls: 本帧控制指令 { turn: -1|0|1, move: -1|0|1 }（fire 走 tryFire）
   update(dt, walls, controls) {
     if (!this.alive) return;
+
+    // 复活无敌时间流逝
+    if (this.invulnTimer > 0) this.invulnTimer = Math.max(0, this.invulnTimer - dt);
 
     // 开炮冷却递减
     if (this.cooldown > 0) this.cooldown -= dt;
@@ -114,6 +135,7 @@ export class Tank {
     }
 
     this.cooldown = BULLET.cooldown;
+    if (this.invulnTimer > 0) this.invulnTimer = 0; // 一旦发起攻击立刻取消复活无敌帧
 
     if (scattering) {
       this.scatterShots--; // 消耗一次扇形开火机会，归零自动恢复单发
@@ -149,6 +171,7 @@ export class Tank {
     if (this.mineCharges <= 0) return null;
 
     this.deployCooldown = 0.25;
+    if (this.invulnTimer > 0) this.invulnTimer = 0; // 布雷攻击同样取消复活无敌帧
     this.mineCharges--;
     this.mineHoldTimer = POWERUP.mine.holdTimeout; // 部署刷新持雷计时
     // 落点沿车尾方向探出，贴墙时 resolveCircleWalls 修回可用位置
@@ -255,6 +278,9 @@ export class Tank {
     if (!this.alive) return;
 
     ctx.save();
+    if (this.invulnTimer > 0) {
+      ctx.globalAlpha = 0.45 + 0.35 * Math.abs(Math.sin(this.invulnTimer * 14));
+    }
     ctx.translate(this.x, this.y);
     ctx.rotate(this.angle);
 
@@ -339,6 +365,23 @@ export class Tank {
       ctx.arc(0, 0, TANK.radius + 6, 0, Math.PI * 2);
       ctx.stroke();
       ctx.setLineDash([]);       // 复位虚线，别污染后续绘制
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+
+    // —— 复活无敌环（绿色旋转脉冲外圈，区别于护盾）——
+    if (this.invulnTimer > 0) {
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      ctx.globalAlpha = 0.65 + 0.3 * Math.abs(Math.sin(this.invulnTimer * 10));
+      ctx.strokeStyle = "#10b981";
+      ctx.lineWidth = 2.2;
+      ctx.setLineDash([4, 4]);
+      ctx.lineDashOffset = this.invulnTimer * 24;
+      ctx.beginPath();
+      ctx.arc(0, 0, TANK.radius + 9, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
       ctx.globalAlpha = 1;
       ctx.restore();
     }

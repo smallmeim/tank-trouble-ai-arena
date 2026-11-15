@@ -97,13 +97,81 @@
     .py-btn-primary:hover {
       background: linear-gradient(135deg, #38bdf8, #3b82f6);
     }
-    .py-btn-accent {
-      background: rgba(245, 158, 11, 0.2);
-      border-color: rgba(245, 158, 11, 0.5);
-      color: #fde68a;
-    }
     .py-btn-accent:hover {
       background: rgba(245, 158, 11, 0.32);
+    }
+    .py-btn-cricket {
+      background: linear-gradient(135deg, #10b981, #059669);
+      border-color: rgba(52, 211, 153, 0.65);
+      color: #ffffff;
+    }
+    .py-btn-cricket:hover {
+      background: linear-gradient(135deg, #34d399, #10b981);
+    }
+    .py-btn-speed-active {
+      background: rgba(168, 85, 247, 0.28);
+      border-color: rgba(192, 132, 252, 0.65);
+      color: #f3e8ff;
+    }
+    .py-stepper {
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      padding: 2px 5px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      color: #f1f5f9;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .py-step-btn {
+      appearance: none;
+      border: none;
+      background: rgba(255, 255, 255, 0.12);
+      color: #f8fafc;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      font-size: 13px;
+      line-height: 1;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.15s;
+    }
+    .py-step-btn:hover {
+      background: rgba(52, 211, 153, 0.45);
+    }
+    .py-step-lbl {
+      padding: 0 2px;
+      color: #cbd5e1;
+    }
+    .py-step-input {
+      width: 28px;
+      border: none;
+      background: transparent;
+      color: #34d399;
+      font: 700 12px Consolas, "Microsoft YaHei", monospace;
+      text-align: center;
+      outline: none;
+      -moz-appearance: textfield;
+      user-select: text;
+    }
+    .py-step-input::-webkit-inner-spin-button,
+    .py-step-input::-webkit-outer-spin-button {
+      -webkit-appearance: none;
+      margin: 0;
+    }
+    .py-step-unit {
+      padding-right: 3px;
+      color: #94a3b8;
+    }
+    .py-bar {
+      max-width: 98vw;
+      flex-wrap: wrap;
+      justify-content: center;
     }
     #py-bot-err {
       font-size: 11px;
@@ -264,6 +332,15 @@
       <span class="py-brand">AI 代码混战</span>
       <button id="py-toggle-drawer" class="py-btn" type="button">配置小车</button>
       <button id="py-start-btn" class="py-btn py-btn-primary" type="button">▶ 立即开战</button>
+      <button id="py-cricket-btn" class="py-btn py-btn-cricket" type="button">🦗 无限斗蛐蛐</button>
+      <button id="py-speed-btn" class="py-btn" type="button" title="切换斗蛐蛐/混战观战倍速">倍速: 1x</button>
+      <span class="py-stepper" title="调节无限斗蛐蛐阵亡复活秒数（0~60 秒，可点数字输入或点 -/+ 微调）">
+        <span class="py-step-lbl">复活</span>
+        <button id="py-respawn-dec" class="py-step-btn" type="button" aria-label="减少复活时间">-</button>
+        <input id="py-respawn-input" class="py-step-input" type="number" min="0" max="60" step="1" value="10" aria-label="复活时间秒数" />
+        <span class="py-step-unit">s</span>
+        <button id="py-respawn-inc" class="py-step-btn" type="button" aria-label="增加复活时间">+</button>
+      </span>
       <button id="py-reload-btn" class="py-btn" type="button">🔄 刷新 bots/</button>
       <button id="py-open-dir-btn" class="py-btn" type="button">打开 bots 文件夹</button>
       <button id="py-prompt-btn" class="py-btn py-btn-accent" type="button">复制 AI 写车提示词</button>
@@ -286,7 +363,7 @@
       </div>
       <div id="py-slots-wrap"></div>
       <div class="drawer-foot">
-        把其他 AI 生成的 <code>.py</code> 放进 <code>bots/</code> 目录，点「🔄 刷新 bots/」即可选给任意小车，也可混入人类手操(WASD/方向键)下场同台竞技。
+        把其他 AI 生成的 <code>.py</code> 放进 <code>bots/</code> 目录，点「🔄 刷新 bots/」即可选给任意小车，也可混入人类手操(WASD/方向键)同台竞技。「🦗 无限斗蛐蛐」会<strong>让全部 bots/*.py 全员上场</strong>，迷宫墙体不可破坏，击杀 +1 分、自己子弹误杀 -1 分、阵亡按上方可调复活时间（默认 10 秒）后随机复活（带开火即取消的无敌帧）。
       </div>
     </div>
   </div>

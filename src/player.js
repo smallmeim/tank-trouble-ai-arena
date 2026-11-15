@@ -25,6 +25,10 @@ export class Player {
 
     this.tank = new Tank(x, y, angle, color);
     this.ai = customCtrl ? customCtrl : (isAI ? new AiController(this, aiLevel) : null);
+    this.respawnTimer = 0;
+    this.cricketKills = 0;
+    this.cricketSelfKills = 0;
+    this.cricketDeaths = 0;
   }
 
   // 本帧控制指令：AI 走控制器决策，人类读键盘。

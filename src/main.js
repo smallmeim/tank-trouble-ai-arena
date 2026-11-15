@@ -25,6 +25,10 @@ import { generateMaze, destroyWallsInRadius, destroyWallSegments } from "./maze.
 import { circleVsCircle, separateCircles, resolveCircleWalls, closestPointOnSegment, findCollidingIndices } from "./collision.js";
 import { fitArena } from "./layout.js";
 import {
+  CRICKET, MELEE_COLORS, normalizeRespawnDelay,
+  stepLoopCount, resolveCricketKillDelta, pickRespawnSpot, formatCricketStats,
+} from "./cricket.js";
+import {
   TankExplosion, PickupFlash, ShieldBreak, MuzzleFlash, MineBlast, WallBreak,
   addShake, updateShake, shakeOffset, resetShake,
 } from "./effects.js";
@@ -190,17 +194,24 @@ let aiLevel = "normal";        // 选中的 AI 难度档（菜单 chip 单选）
 // 初始从 localStorage 读上次组合，没存过默认全启;变化即写盘。
 let enabledPowerups = new Set(loadEnabledPowerups() ?? POWERUP.types);
 let wallBreakEnabled = loadWallBreak() ?? true; // 地雷炸墙开关（菜单「地形」chip，默认开）
-// 本局实际生效的地形破坏（关卡模式由关卡表覆写，不动全局设置）
-const wallBreakActive = () => (currentMode === "challenge" ? levelWallBreak : wallBreakEnabled);
+// 本局实际生效的地形破坏（关卡模式由关卡表覆写；无限斗蛐蛐不重抽迷宫，禁磨墙防变空地）
+const wallBreakActive = () => {
+  if (currentMode === "challenge") return levelWallBreak;
+  if (isPyMelee() && endlessCricket) return false;
+  return wallBreakEnabled;
+};
 // 单人模式（挑战/波次）：players 长度可变、战绩口径与 1v1 不同 →
 // 不进终身统计（stats.players 定长 2，第三车会越界），慢镜只在终局（见 pendingSoloSlowmo）
 const soloMode = () => currentMode === "challenge" || currentMode === "wave";
 const isPyMelee = () => currentMode === "py_melee";
-const MELEE_COLORS = [PLAYER_COLORS[0], ...ENEMY_COLORS];
 let pyMeleeSlots = [];
 let pyRoundId = 1;
 let lastWallCount = 0;
 let wallVersion = 1;
+let endlessCricket = false;
+let cricketSpeed = 1;
+let cricketRespawnDelay = CRICKET.respawnDelay;
+let cricketElapsed = 0;
 // 本关的限时/生存秒数上限（0 = 不限时的歼灭关）。HUD 读它算剩余秒数——
 // 秒数字段的解析只在 objectiveOf 一处，别在 HUD 里再拆 mutators
 const challengeSecs = () => objectiveOf(LEVELS[currentLevelIndex]).secs ?? 0;
@@ -231,7 +242,16 @@ const levelSelect = { open: false };
 // 模块闭包外唯一的状态窥视口。只读快照 + 强设比分（快进局胜流转测试），
 // 不进任何正常交互路径；本地单机游戏，常驻无害。
 window.__devHook = {
-  snapshot: () => ({ state, matchScores: [...matchScores], winnerIndex: winner ? winner.index : null }),
+  snapshot: () => ({
+    state,
+    matchScores: [...matchScores],
+    winnerIndex: winner ? winner.index : null,
+    endlessCricket,
+    cricketElapsed,
+    cricketSpeed,
+    cricketRespawnDelay,
+    respawns: players.map((p) => Math.ceil(p.respawnTimer || 0)),
+  }),
   forceScores: (a, b) => { matchScores = [a, b]; },
   setTank: (i, patch) => { if (players[i]) Object.assign(players[i].tank, patch); },
   // setTank 的只读对偶：验证「某个状态下人还能不能动」需要能读位置（如波间喘息不冻结）。
@@ -240,7 +260,7 @@ window.__devHook = {
   tankAt: (i) => {
     const t = players[i]?.tank;
     return t ? {
-      x: t.x, y: t.y, angle: t.angle, alive: t.alive,
+      x: t.x, y: t.y, angle: t.angle, alive: t.alive, invuln: t.invulnTimer,
       scatter: t.scatterShots, laser: t.laserShots, mine: t.mineCharges, shield: t.shield,
     } : null;
   },
@@ -344,10 +364,15 @@ window.__devHook = {
 // 开一整场：从菜单进入时调用。清零累计分，再开第一回合。
 // 与 setupRound 的分工：startMatch 负责「整场」级状态(分数)，
 // setupRound 只负责「单回合」级状态(地图/玩家)。回合重开只走 setupRound，分数不动。
-function startMatch(mode, extraSlots = null) {
+function startMatch(mode, extraSlots = null, options = {}) {
+  endlessCricket = mode === "py_melee" && !!options.endless;
+  if (typeof options.respawnDelay === "number") {
+    cricketRespawnDelay = normalizeRespawnDelay(options.respawnDelay);
+  }
+  cricketElapsed = 0;
   if (mode === "py_melee") {
     if (Array.isArray(extraSlots) && extraSlots.length >= 2) {
-      pyMeleeSlots = extraSlots.slice(0, 6);
+      pyMeleeSlots = endlessCricket ? extraSlots.slice() : extraSlots.slice(0, 6);
     }
     const n = Math.max(2, pyMeleeSlots.length || 2);
     matchScores = new Array(n).fill(0);
@@ -373,14 +398,33 @@ function pickMeleeSpawns(m, count) {
     { c: Math.floor(m.cols / 2), r: 0 },
     { c: Math.floor(m.cols / 2), r: m.rows - 1 },
   ];
-  const pts = [];
+  const chosen = [];
+  const used = new Set();
   for (let i = 0; i < count; i++) {
-    const cell = anchors[i % anchors.length];
-    const x = cell.c * CELL_SIZE + half;
-    const y = cell.r * CELL_SIZE + half;
-    pts.push({ x, y, a: Math.atan2(cy - y, cx - x) });
+    let pick = i < anchors.length ? anchors[i] : null;
+    if (!pick || used.has(`${pick.c},${pick.r}`)) {
+      let best = null;
+      let bestDist = -1;
+      for (let r = 0; r < m.rows; r++) {
+        for (let c = 0; c < m.cols; c++) {
+          if (used.has(`${c},${r}`)) continue;
+          const x = c * CELL_SIZE + half;
+          const y = r * CELL_SIZE + half;
+          const minD = chosen.reduce((mn, s) => Math.min(mn, Math.hypot(x - s.x, y - s.y)), Infinity);
+          if (minD > bestDist) {
+            bestDist = minD;
+            best = { c, r };
+          }
+        }
+      }
+      pick = best || anchors[i % anchors.length];
+    }
+    used.add(`${pick.c},${pick.r}`);
+    const x = pick.c * CELL_SIZE + half;
+    const y = pick.r * CELL_SIZE + half;
+    chosen.push({ x, y, a: Math.atan2(cy - y, cx - x) });
   }
-  return pts;
+  return chosen;
 }
 
 // 生成地图 + 算自适应缩放 + 返回四角出生位。
@@ -534,6 +578,13 @@ function setupRound(mode) {
   draft.hover = -1;
   winner = null;
   pendingSoloSlowmo = false;
+  cricketElapsed = 0;
+  for (const p of players) {
+    p.respawnTimer = 0;
+    p.cricketKills = 0;
+    p.cricketSelfKills = 0;
+    p.cricketDeaths = 0;
+  }
   // 波次第 1 波必须等实体数组清空后再起（开波补给要 push 进新的 powerups）
   if (mode === "wave") beginWave(1);
   introTimer = ROUND_INTRO.beat * 3; // 3-2-1 三拍冻结开场
@@ -547,13 +598,21 @@ let lastTime = 0;
 function loop(now) {
   const dt = lastTime ? Math.min((now - lastTime) / 1000, 0.05) : 0;
   lastTime = now;
-  // 击杀慢动作：游戏时间缩放；slowmo 自身与 GO 余像用真实 dt 衰减
-  // （若用缩放后 dt 衰减，慢动作会把自己拖慢 1/scale 倍）
-  const gameDt = slowmoTimer > 0 ? dt * SLOWMO.scale : dt;
-  slowmoTimer = Math.max(0, slowmoTimer - dt);
-  goTimer = Math.max(0, goTimer - dt);
-  advanceHints(dt); // 同样用真实 dt：慢镜不该把一条提示拉长到 13 秒
-  update(gameDt);
+  const steps = stepLoopCount({
+    isPyMelee: isPyMelee(),
+    isActiveOrSettlement: state === STATE.PLAYING || state === STATE.ROUND_OVER,
+    cricketSpeed,
+  });
+  for (let s = 0; s < steps; s++) {
+    // 击杀慢动作：游戏时间缩放；slowmo 自身与 GO 余像用真实 dt 衰减
+    // （若用缩放后 dt 衰减，慢动作会把自己拖慢 1/scale 倍）
+    const gameDt = slowmoTimer > 0 ? dt * SLOWMO.scale : dt;
+    slowmoTimer = Math.max(0, slowmoTimer - dt);
+    goTimer = Math.max(0, goTimer - dt);
+    advanceHints(dt); // 同样用真实 dt：慢镜不该把一条提示拉长到 13 秒
+    update(gameDt);
+    if (!isPyMelee() || (state !== STATE.PLAYING && state !== STATE.ROUND_OVER)) break;
+  }
   render();
   requestAnimationFrame(loop);
 }
@@ -806,6 +865,7 @@ function advanceHints(dt) {
 // 模式分流集中在这一处（单人模式多敌人：非终局击杀不慢镜、不进终身统计）。
 // 返回 true=击杀成功，false=被盾挡下。
 function hitPlayer(p, weapon, killerTank, ignoreShield = false) {
+  if (!p.alive || p.tank.invulnTimer > 0) return false;
   const killerIndex = players.findIndex((pp) => pp.tank === killerTank);
   if (p.tank.shield && !ignoreShield) {
     p.tank.shield = false;
@@ -818,7 +878,21 @@ function hitPlayer(p, weapon, killerTank, ignoreShield = false) {
   }
   p.tank.shield = false;
   p.tank.shieldTimer = 0;
+  p.tank.invulnTimer = 0;
   p.tank.alive = false;
+  if (isPyMelee() && endlessCricket) {
+    const victimIndex = players.indexOf(p);
+    const { scorerIndex, delta, selfHit } = resolveCricketKillDelta({ victimIndex, killerIndex, weapon });
+    if (scorerIndex >= 0 && delta !== 0) {
+      matchScores[scorerIndex] = (matchScores[scorerIndex] ?? 0) + delta;
+    }
+    if (selfHit) p.cricketSelfKills = (p.cricketSelfKills || 0) + 1;
+    else if (delta > 0 && players[scorerIndex]) {
+      players[scorerIndex].cricketKills = (players[scorerIndex].cricketKills || 0) + 1;
+    }
+    p.cricketDeaths = (p.cricketDeaths || 0) + 1;
+    p.respawnTimer = cricketRespawnDelay;
+  }
   // 被**自己的跳弹**打死：新玩家的第一死因，而画面上没有任何东西说明
   // 「反弹后的子弹不认主人」。**判据必须按武器分流**（见 hints.isRicochetSelfKill）：
   // `hitPlayer` 有三个调用者，地雷传 `m.owner`、激光传 `shooter.tank`，所以只看
@@ -829,7 +903,7 @@ function hitPlayer(p, weapon, killerTank, ignoreShield = false) {
   addShake(5, 0.3);
   playSfx("kill");
   if (!soloMode() && !isPyMelee()) slowmoTimer = SLOWMO.duration; // 1v1 任何击杀=终杀
-  else pendingSoloSlowmo = true; // 单人/混战模式：是否终局由胜负段确认后再慢镜
+  else if (!(isPyMelee() && endlessCricket)) pendingSoloSlowmo = true; // 单人/常规混战模式：是否终局由胜负段确认后再慢镜
   if (!soloMode() && !isPyMelee() && killerIndex >= 0 && killerTank !== p.tank) recordKill(killerIndex, weapon);
   // 波次战绩：敌人被击破就 +1（含互相误伤/踩雷——场是你控的，算你的）
   if (currentMode === "wave" && p !== players[0]) {
@@ -906,12 +980,29 @@ function updatePlaying(dt) {
   //      单人挑战 / 波次模式（soloMode）：保留原版等量推开，防止多敌波次同室误撞互杀。
   const alivePlayersBefore = players.filter((p) => p.alive);
   if (!soloMode()) {
+    const vulnerable = alivePlayersBefore.filter((p) => p.tank.invulnTimer <= 0);
     const crashed = findCollidingIndices(
-      alivePlayersBefore.map((p) => p.tank),
+      vulnerable.map((p) => p.tank),
       TANK.radius * 2,
     );
     for (const idx of crashed) {
-      hitPlayer(alivePlayersBefore[idx], "collision", null, true);
+      hitPlayer(vulnerable[idx], "collision", null, true);
+    }
+    // 处于无敌帧中的车不触发对撞必死，只做等量推开免得退无敌瞬间重叠互杀
+    for (let i = 0; i < alivePlayersBefore.length; i++) {
+      for (let j = i + 1; j < alivePlayersBefore.length; j++) {
+        const a = alivePlayersBefore[i].tank;
+        const b = alivePlayersBefore[j].tank;
+        if (!a.alive || !b.alive || (a.invulnTimer <= 0 && b.invulnTimer <= 0)) continue;
+        const sep = separateCircles(a.x, a.y, b.x, b.y, TANK.radius * 2);
+        if (!sep) continue;
+        a.x = sep.ax; a.y = sep.ay;
+        b.x = sep.bx; b.y = sep.by;
+        const fa = resolveCircleWalls(a.x, a.y, TANK.radius, maze.walls);
+        a.x = fa.x; a.y = fa.y;
+        const fb = resolveCircleWalls(b.x, b.y, TANK.radius, maze.walls);
+        b.x = fb.x; b.y = fb.y;
+      }
     }
   } else {
     const aliveTanksSep = alivePlayersBefore.map((p) => p.tank);
@@ -971,7 +1062,7 @@ function updatePlaying(dt) {
   for (const m of mines) {
     if (m.exploded || !m.armed) continue;
     const tripped = players.some(
-      (p) => p.alive && Math.hypot(p.tank.x - m.x, p.tank.y - m.y) < POWERUP.mine.triggerRadius
+      (p) => p.alive && p.tank.invulnTimer <= 0 && Math.hypot(p.tank.x - m.x, p.tank.y - m.y) < POWERUP.mine.triggerRadius
     );
     if (!tripped) continue;
     m.exploded = true;
@@ -985,7 +1076,7 @@ function updatePlaying(dt) {
       if (broken.length) playSfx("wallBreak");
     }
     for (const p of players) {
-      if (!p.alive) continue;
+      if (!p.alive || p.tank.invulnTimer > 0) continue;
       if (Math.hypot(p.tank.x - m.x, p.tank.y - m.y) >= POWERUP.mine.blastRadius) continue;
       hitPlayer(p, "mine", m.owner);
     }
@@ -1034,7 +1125,7 @@ function updatePlaying(dt) {
   for (const b of bullets) {
     if (b.dead) continue;
     for (const p of players) {
-      if (!p.alive) continue;
+      if (!p.alive || p.tank.invulnTimer > 0) continue;
       if (!b.canHit(p.tank)) continue;
       if (circleVsCircle(b.x, b.y, BULLET.radius, p.tank.x, p.tank.y, TANK.radius)) {
         // 护盾挡一发即碎 / 无盾即死——统一走 hitPlayer；子弹两种结局都消失
@@ -1104,12 +1195,34 @@ function updatePlaying(dt) {
     return;
   }
 
-  // pvp/pve/py_melee：存活 ≤1 转结算
+  // 无限斗蛐蛐：全部车上场混战，打败 +1 分、自弹打中自己 -1 分、死亡 10s 随机复活且带开火即取消的无敌帧，永不终局
+  if (isPyMelee() && endlessCricket) {
+    cricketElapsed += dt;
+    for (const p of players) {
+      if (p.alive) continue;
+      if (p.respawnTimer > 0) p.respawnTimer = Math.max(0, p.respawnTimer - dt);
+      if (p.respawnTimer <= 0) {
+        const spot = pickRespawnSpot({
+          cols: maze.cols,
+          rows: maze.rows,
+          cellSize: CELL_SIZE,
+          avoidTanks: players.filter((pp) => pp.alive).map((pp) => pp.tank),
+          bullets,
+          mines,
+        });
+        p.tank.resetAt(spot.x, spot.y, spot.a, CRICKET.spawnInvuln);
+        p.ai?.reset?.();
+        effects.push(new ShieldBreak(spot.x, spot.y, p.color));
+      }
+    }
+    return;
+  }
+
+  // pvp/pve/py_melee(常规 5 分制)：存活 ≤1 转结算
   const alivePlayers = players.filter((p) => p.alive);
   if (alivePlayers.length <= 1) {
     winner = alivePlayers.length === 1 ? alivePlayers[0] : null;
     // 计分：转 ROUND_OVER 这一帧加一次（同归于尽 winner=null 不加分）。
-    // 状态切走后不再进 updatePlaying，天然只触发一次，无需额外加锁。
     if (winner) matchScores[winner.index]++;
     if (isPyMelee()) slowmoTimer = SLOWMO.duration;
     else recordRoundEnd(winner ? winner.index : null); // 胜场 + P1 连胜推进
@@ -1149,7 +1262,7 @@ function fireLaser(origin, shooter = null) {
     // 取沿段参数最小者（同段两车都在线上时，先扫到谁谁挨打）
     let hit = null;
     for (const p of players) {
-      if (!p.alive) continue;
+      if (!p.alive || p.tank.invulnTimer > 0) continue;
       if (i === 0 && shooter && p === shooter) continue; // 首段跳过射手（见上）
       const cp = closestPointOnSegment(p.tank.x, p.tank.y, a.x, a.y, b.x, b.y);
       if (Math.hypot(p.tank.x - cp.x, p.tank.y - cp.y) > TANK.radius) continue;
@@ -1754,8 +1867,91 @@ function renderArena() {
       hold: holdZone ? { progress: holdZone.progress, need: holdZone.need, inside: holdZone.inside } : null,
     } : null,
   });
+  renderCricketStrip(ctx);
 }
 
-setupPyBridgeUI({ onStartMelee: (slots) => startMatch("py_melee", slots) });
+/** 无限斗蛐蛐模式底部实时积分与复活状态条 */
+function renderCricketStrip(ctx) {
+  if (!isPyMelee() || !endlessCricket || players.length === 0) return;
+
+  const { header, entries: ranked } = formatCricketStats({
+    players,
+    matchScores,
+    cricketElapsed,
+    cricketSpeed,
+    cricketRespawnDelay,
+  });
+
+  ctx.save();
+  ctx.font = "600 11.5px system-ui, 'Microsoft YaHei', sans-serif";
+  ctx.textBaseline = "middle";
+
+  const padX = 12;
+  const gap = 12;
+  const dotR = 4.5;
+  const headerW = ctx.measureText(header).width;
+  const entryWidths = ranked.map((r) => dotR * 2 + 5 + ctx.measureText(r.text).width);
+  const totalW = Math.min(
+    CANVAS.width - 24,
+    padX * 2 + headerW + 14 + entryWidths.reduce((s, w) => s + w, 0) + Math.max(0, ranked.length - 1) * gap,
+  );
+  const pillH = 24;
+  const pillX = (CANVAS.width - totalW) / 2;
+  const pillY = CANVAS.height - 54;
+
+  ctx.fillStyle = "rgba(15, 23, 42, 0.86)";
+  ctx.strokeStyle = "rgba(52, 211, 153, 0.45)";
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(pillX, pillY, totalW, pillH, 999);
+  else ctx.rect(pillX, pillY, totalW, pillH);
+  ctx.fill();
+  ctx.stroke();
+
+  let x = pillX + padX;
+  const cy = pillY + pillH / 2;
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#34d399";
+  ctx.fillText(header, x, cy);
+  x += headerW + 7;
+
+  ctx.strokeStyle = "rgba(148, 163, 184, 0.35)";
+  ctx.beginPath();
+  ctx.moveTo(x, pillY + 5);
+  ctx.lineTo(x, pillY + pillH - 5);
+  ctx.stroke();
+  x += 7;
+
+  const maxX = pillX + totalW - padX;
+  for (let i = 0; i < ranked.length; i++) {
+    const r = ranked[i];
+    if (x + dotR * 2 + 24 > maxX) break;
+    ctx.fillStyle = r.color;
+    ctx.beginPath();
+    ctx.arc(x + dotR, cy, dotR, 0, Math.PI * 2);
+    ctx.fill();
+    x += dotR * 2 + 5;
+    ctx.fillStyle = r.alive ? "#f8fafc" : "#94a3b8";
+    ctx.fillText(r.text, x, cy, Math.max(24, maxX - x));
+    x += ctx.measureText(r.text).width + gap;
+  }
+  ctx.restore();
+}
+
+setupPyBridgeUI({
+  onStartMelee: (slots) => startMatch("py_melee", slots, { endless: false }),
+  onStartCricket: (slots, opts) => startMatch("py_melee", slots, { endless: true, ...opts }),
+  onCycleSpeed: (spd) => { cricketSpeed = spd; },
+  onChangeRespawn: (sec) => {
+    cricketRespawnDelay = normalizeRespawnDelay(sec);
+    if (isPyMelee() && endlessCricket) {
+      for (const p of players) {
+        if (!p.alive && p.respawnTimer > cricketRespawnDelay) {
+          p.respawnTimer = cricketRespawnDelay;
+        }
+      }
+    }
+  },
+});
 
 requestAnimationFrame(loop);

@@ -894,7 +894,8 @@ export function renderHud(ctx, { players, matchScores, isPlaying, challenge, wav
       const cx = 16 + slotW * (i + 0.5);
       const score = matchScores[i] ?? 0;
       const shortName = String(p.label || `P${i + 1}`).slice(0, 10);
-      const labelTxt = `${shortName} ${score}${p.alive ? "" : " ✕"}`;
+      const deadTag = p.respawnTimer > 0 ? ` ↻${Math.ceil(p.respawnTimer)}s` : " ✕";
+      const labelTxt = `${shortName} ${score}${p.alive ? "" : deadTag}`;
       const tw = ctx.measureText(labelTxt).width;
       const dotX = cx - tw / 2 - 9;
       ctx.fillStyle = p.color;

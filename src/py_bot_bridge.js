@@ -5,8 +5,7 @@
 // ============================================================
 
 import { PLAYER_COLORS, ENEMY_COLORS, TANK } from "./config.js";
-
-const MELEE_COLORS = [PLAYER_COLORS[0], ...ENEMY_COLORS];
+import { CRICKET, MELEE_COLORS, normalizeRespawnDelay } from "./cricket.js";
 
 const registry = new Map(); // slotIdx -> PyBotController
 let lastRoundSeq = -1;
@@ -34,6 +33,14 @@ export class PyBotController {
     if (res.fire) this.pendingFire = true;
     if (res.special) this.pendingSpecial = true;
     if (res.mode) this.mode = String(res.mode);
+  }
+
+  reset() {
+    this.lastCmd.move = 0;
+    this.lastCmd.turn = 0;
+    this.pendingFire = false;
+    this.pendingSpecial = false;
+    this.mode = "Respawn";
   }
 
   update(_dt, _world) {
@@ -116,6 +123,7 @@ export function stepPyBridge(dt, world, players, roundId, wallVersion) {
       cooldown: p.tank.cooldown,
       shield: !!p.tank.shield,
       shieldTimer: p.tank.shieldTimer || 0,
+      invulnTimer: p.tank.invulnTimer || 0,
       scatterShots: p.tank.scatterShots || 0,
       laserShots: p.tank.laserShots || 0,
       mineCharges: p.tank.mineCharges || 0,
@@ -178,7 +186,7 @@ export function stepPyBridge(dt, world, players, roundId, wallVersion) {
 // ============================================================
 // UI Overlay: 顶部 AI 代码小车配置 bar + 抽屉 + Prompt 复制窗
 // ============================================================
-export function setupPyBridgeUI({ onStartMelee }) {
+export function setupPyBridgeUI({ onStartMelee, onStartCricket, onCycleSpeed, onChangeRespawn }) {
   if (typeof document === "undefined") return;
 
   const root = document.getElementById("py-arena-ui");
@@ -224,6 +232,16 @@ export function setupPyBridgeUI({ onStartMelee }) {
       });
     }
     return out;
+  }
+
+  function buildAllBotsPayload() {
+    const out = roster.py_bots.map((b) => ({ controller: b.id, label: b.name }));
+    if (out.length >= 2) return out;
+    for (const s of buildSlotsPayload()) {
+      if (out.length >= 2) break;
+      if (!out.some((x) => x.controller === s.controller)) out.push(s);
+    }
+    return out.length >= 2 ? out : buildSlotsPayload();
   }
 
   function renderUI() {
@@ -318,6 +336,70 @@ export function setupPyBridgeUI({ onStartMelee }) {
     drawerOpen = false;
     renderUI();
     onStartMelee(buildSlotsPayload());
+    blurActive();
+  });
+
+  document.getElementById("py-cricket-btn")?.addEventListener("click", async () => {
+    drawerOpen = false;
+    renderUI();
+    await refreshBots(false);
+    onStartCricket?.(buildAllBotsPayload(), { respawnDelay: respawnSec });
+    blurActive();
+  });
+
+  const RESPAWN_STORAGE_KEY = "py_cricket_respawn_sec";
+  let respawnSec = CRICKET.respawnDelay;
+  try {
+    const saved = localStorage.getItem(RESPAWN_STORAGE_KEY);
+    if (saved !== null) respawnSec = normalizeRespawnDelay(saved);
+  } catch (_) {}
+
+  const respawnInput = document.getElementById("py-respawn-input");
+  function applyRespawnSec(nextVal, commitInput = true) {
+    respawnSec = normalizeRespawnDelay(nextVal);
+    if (respawnInput && commitInput) respawnInput.value = String(respawnSec);
+    try {
+      localStorage.setItem(RESPAWN_STORAGE_KEY, String(respawnSec));
+    } catch (_) {}
+    onChangeRespawn?.(respawnSec);
+  }
+  if (respawnInput) {
+    respawnInput.value = String(respawnSec);
+    respawnInput.addEventListener("input", () => {
+      if (respawnInput.value === "") return;
+      applyRespawnSec(respawnInput.value, false);
+    });
+    respawnInput.addEventListener("change", () => {
+      applyRespawnSec(respawnInput.value, true);
+      blurActive();
+    });
+    respawnInput.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter" || e.key === "Escape") {
+        applyRespawnSec(respawnInput.value, true);
+        blurActive();
+      }
+    });
+    respawnInput.addEventListener("keyup", (e) => e.stopPropagation());
+  }
+  document.getElementById("py-respawn-dec")?.addEventListener("click", () => {
+    applyRespawnSec(respawnSec - 1, true);
+    blurActive();
+  });
+  document.getElementById("py-respawn-inc")?.addEventListener("click", () => {
+    applyRespawnSec(respawnSec + 1, true);
+    blurActive();
+  });
+  onChangeRespawn?.(respawnSec);
+
+  let cricketSpeedIdx = 0;
+  const speedBtn = document.getElementById("py-speed-btn");
+  speedBtn?.addEventListener("click", () => {
+    cricketSpeedIdx = (cricketSpeedIdx + 1) % CRICKET.speeds.length;
+    const speed = CRICKET.speeds[cricketSpeedIdx];
+    speedBtn.textContent = `倍速: ${speed}x`;
+    speedBtn.classList.toggle("py-btn-speed-active", speed > 1);
+    onCycleSpeed?.(speed);
     blurActive();
   });
 
